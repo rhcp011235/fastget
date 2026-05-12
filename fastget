@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # fastget - universal aria2c wrapper with host resolvers.
 # Supports direct URLs, Pixeldrain, Gofile, SwissTransfer, Google Drive,
-# Seyarabata, Transfer.it, magnet links, and local/remote .torrent files.
+# Seyarabata, Transfer.it, Yandex Disk, magnet links, and local/remote
+# .torrent files.
 
 set -euo pipefail
 
@@ -23,6 +24,7 @@ Examples:
   ${PROGRAM} -o file.zip https://example.com/download
   ${PROGRAM} -p secret https://www.swisstransfer.com/d/<id>
   ${PROGRAM} https://transfer.it/t/<id>
+  ${PROGRAM} https://disk.yandex.com.tr/d/<id>
   ${PROGRAM} --interface en9 https://example.com/huge.bin
   ${PROGRAM} --parallel 6 https://example.com/a.bin https://example.com/b.bin
   ${PROGRAM} "magnet:?xt=urn:btih:..."
@@ -30,7 +32,8 @@ Examples:
 
 Supported:
   direct HTTP(S), Pixeldrain, Gofile, SwissTransfer, Google Drive, Seyarabata,
-  Transfer.it, magnet links, local .torrent files, and remote .torrent URLs.
+  Transfer.it, Yandex Disk, magnet links, local .torrent files, and remote
+  .torrent URLs.
 
 Options:
   --sane                 Use a less aggressive aria2 profile.
@@ -56,6 +59,7 @@ Environment:
   ARIA_BT_TRACKERS       Comma-separated extra BitTorrent trackers.
   ARIA_BT_STOP_TIMEOUT   Stop torrent if speed is 0 for this many seconds.
   FASTGET_TRANSFERIT_API Transfer.it API base, default https://bt7.api.mega.co.nz.
+  FASTGET_YANDEXDISK_API Yandex public resources API base.
 EOF
 }
 
@@ -234,6 +238,15 @@ is_transferit() {
   host="$(url_host "$1")"
   case "$host" in
     transfer.it|www.transfer.it) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_yandexdisk() {
+  local host
+  host="$(url_host "$1")"
+  case "$host" in
+    yadi.sk|www.yadi.sk|disk.yandex.*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -712,6 +725,66 @@ resolve_transferit() {
   fi
 }
 
+resolve_yandexdisk() {
+  local url="$1"
+  local api_base encoded_url metadata_url download_url metadata_json download_json
+  local api_error api_message resource_type filename href
+
+  need_tool curl "macOS normally includes curl."
+  need_tool jq "Install it with: brew install jq"
+
+  api_base="${FASTGET_YANDEXDISK_API:-https://cloud-api.yandex.net/v1/disk/public/resources}"
+  api_base="${api_base%/}"
+  encoded_url="$(jq -nr --arg url "$url" '$url | @uri')"
+  metadata_url="${api_base}?public_key=${encoded_url}&limit=1"
+  download_url="${api_base}/download?public_key=${encoded_url}"
+
+  note "Yandex Disk: resolving public resource"
+  if ! metadata_json="$(curl_json "$metadata_url")"; then
+    die "Yandex Disk metadata request failed"
+  fi
+
+  api_error="$(json_value "$metadata_json" '.error // empty')"
+  if [ -n "$api_error" ] && [ "$api_error" != "null" ]; then
+    api_message="$(json_value "$metadata_json" '.message // .description // "unknown error"')"
+    die "Yandex Disk metadata API error: ${api_message}"
+  fi
+
+  resource_type="$(json_value "$metadata_json" '.type // empty')"
+  filename="$(json_value "$metadata_json" '.name // empty')"
+  if [ -n "$filename" ] && [ "$filename" != "null" ]; then
+    filename="$(sanitize_provider_name "$filename")"
+    if [ "$resource_type" = "dir" ]; then
+      case "$(lower "$filename")" in
+        *.zip) ;;
+        *) filename="${filename}.zip" ;;
+      esac
+    fi
+  else
+    filename=""
+  fi
+
+  if ! download_json="$(curl_json "$download_url")"; then
+    die "Yandex Disk download URL request failed"
+  fi
+
+  api_error="$(json_value "$download_json" '.error // empty')"
+  if [ -n "$api_error" ] && [ "$api_error" != "null" ]; then
+    api_message="$(json_value "$download_json" '.message // .description // "unknown error"')"
+    die "Yandex Disk download API error: ${api_message}"
+  fi
+
+  href="$(json_value "$download_json" '.href // empty')"
+  [ -n "$href" ] && [ "$href" != "null" ] || die "Yandex Disk response did not include a download URL"
+
+  append_download "$href" "$filename" "" "$url" "yandexdisk"
+  if [ -n "$filename" ]; then
+    note "Yandex Disk: resolved ${filename}"
+  else
+    note "Yandex Disk: resolved download endpoint"
+  fi
+}
+
 resolve_gofile() {
   local url="$1"
   local path content_id account_json account_status account_token
@@ -892,6 +965,8 @@ resolve_input() {
     resolve_seyarabata "$item"
   elif is_transferit "$item"; then
     resolve_transferit "$item"
+  elif is_yandexdisk "$item"; then
+    resolve_yandexdisk "$item"
   else
     if is_torrent_like "$item" && ! has_uri_scheme "$item"; then
       case "$(lower "$item")" in
