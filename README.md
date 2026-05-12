@@ -13,6 +13,7 @@ Current supported input types:
 - SwissTransfer transfer links.
 - Google Drive file links.
 - Seyarabata file links.
+- Transfer.it transfer links.
 - Magnet links.
 - Local `.torrent` files.
 - Remote HTTP(S) `.torrent` URLs.
@@ -38,6 +39,7 @@ Run downloads from this repo:
 ./fastget -p 'secret' 'https://gofile.io/d/CONTENT_ID'
 ./fastget -p 'secret' 'https://www.swisstransfer.com/d/TRANSFER_ID'
 ./fastget 'https://seyarabata.com/FILE_ID'
+./fastget 'https://transfer.it/t/TRANSFER_ID'
 ./fastget --interface en9 'https://example.com/huge-file.bin'
 ./fastget --parallel 6 'https://example.com/a.bin' 'https://example.com/b.bin'
 ./fastget 'magnet:?xt=urn:btih:...'
@@ -58,7 +60,7 @@ Options:
 - `--aggressive`: explicitly use the default aggressive profile.
 - `-o, --output NAME`: force the output filename when exactly one HTTP file is
   downloaded.
-- `-p, --password VALUE`: password for Gofile or SwissTransfer.
+- `-p, --password VALUE`: password for Gofile, SwissTransfer, or Transfer.it.
 - `--interface IFACE`: bind `aria2c` sockets to one interface. On the target
   MacBook Pro, `en9` is the 10GbE Thunderbolt Ethernet interface.
 - `--parallel N`: number of resolved HTTP files to download in parallel. This
@@ -69,6 +71,7 @@ Password can also be supplied as:
 
 ```bash
 FASTGET_PASSWORD='secret' fastget 'https://gofile.io/d/CONTENT_ID'
+FASTGET_PASSWORD='secret' fastget 'https://transfer.it/t/TRANSFER_ID'
 ```
 
 For compatibility with the Telegram bot command style, this also works when the
@@ -85,7 +88,8 @@ At a high level, `fastget` turns each user input into one or more concrete
 download jobs, then runs `aria2c` for each job.
 
 For direct URLs, magnets, and torrents, the input is already usable by `aria2c`.
-For provider links such as Gofile, SwissTransfer, or Seyarabata, the script
+For provider links such as Gofile, SwissTransfer, Seyarabata, or Transfer.it,
+the script
 first resolves the provider page/API, extracts direct file URLs or provider
 download endpoints, chooses output filenames when available, attaches any
 required cookies or tokens, then hands the final URLs to `aria2c`.
@@ -332,6 +336,74 @@ found during resolution.
 Already-signed `dl.seyarabata.com/...` URLs are treated as ordinary direct URLs
 instead of Seyarabata provider links.
 
+### Transfer.it
+
+Recognized hosts:
+
+- `transfer.it`
+- `www.transfer.it`
+
+Supported format:
+
+```text
+https://transfer.it/t/TRANSFER_ID
+```
+
+Resolver behavior:
+
+1. Extracts `TRANSFER_ID` from `/t/TRANSFER_ID`. Transfer.it's own JavaScript
+   names this value `xh`.
+2. Calls the Transfer.it/MEGA-style metadata API:
+
+```text
+POST https://bt7.api.mega.co.nz/cs?id=0
+body: [{"a":"xi","xh":"TRANSFER_ID"}]
+```
+
+3. Reads the transfer title token from `t` when present. The title is
+   base64url-decoded and used as the aria2 output filename.
+4. Checks `pw`. If the link is password-protected, `fastget` requires `-p` or
+   `FASTGET_PASSWORD`, derives the same PBKDF2-SHA256 password token used by the
+   Transfer.it web client, and validates it with:
+
+```text
+POST https://bt7.api.mega.co.nz/cs?id=0
+body: [{"a":"xv","xh":"TRANSFER_ID","pw":"PASSWORD_TOKEN"}]
+```
+
+5. For single-file transfers, fetches the file list:
+
+```text
+POST https://bt7.api.mega.co.nz/cs?id=0&x=TRANSFER_ID
+body: [{"a":"f","c":1,"r":1}]
+```
+
+6. Selects the first non-folder node (`t == 0`) as the downloadable file node.
+7. For multi-file transfers, uses the archive node `z` from metadata when the
+   API provides it. The output filename is forced to `.zip` if needed.
+8. Requests a signed CDN download URL:
+
+```text
+POST https://bt7.api.mega.co.nz/cs?id=0&x=TRANSFER_ID
+body: [{"a":"g","n":"NODE_HANDLE","pt":1,"g":1,"ssl":1}]
+```
+
+9. Appends the URL-encoded filename to the signed URL and passes it to `aria2c`.
+
+Important detail: Transfer.it's static page is only a JavaScript bootloader. The
+actual direct URL is not in the HTML. `fastget` therefore uses the same
+underlying API flow as the web client. The signed CDN URL accepted a ranged GET
+during testing, so aria2 segmented downloads can use the aggressive 10GbE HTTP
+profile.
+
+Limitations:
+
+- Transfer.it signed CDN URLs are generated during resolver time. Start the
+  download immediately after resolution instead of storing those URLs for later.
+- Multi-file Transfer.it links need the API to expose an archive node `z`. If a
+  multi-file link lacks that archive node, `fastget` stops rather than silently
+  downloading only one item.
+
 ### Magnet Links
 
 Recognized format:
@@ -457,7 +529,8 @@ or provider throttling.
 
 General:
 
-- `FASTGET_PASSWORD`: fallback password for Gofile or SwissTransfer.
+- `FASTGET_PASSWORD`: fallback password for Gofile, SwissTransfer, or
+  Transfer.it.
 - `FASTGET_INTERFACE`: optional aria2 socket binding interface, for example
   `en9` for the 10GbE Thunderbolt Ethernet port.
 - `FASTGET_PARALLEL`: parallel HTTP file downloads after provider resolution.
@@ -490,6 +563,12 @@ Gofile:
 
 - `FASTGET_GOFILE_WEBSITE_TOKEN`: overrides the static Gofile website token.
 
+Transfer.it:
+
+- `FASTGET_TRANSFERIT_API`: overrides the Transfer.it API base. Default is
+  `https://bt7.api.mega.co.nz`. This is only here in case Transfer.it moves the
+  API host used by the web client.
+
 BitTorrent:
 
 - `ARIA_BT_TRACKERS`: comma-separated additional trackers.
@@ -515,14 +594,16 @@ Required for all downloads:
 Required for provider resolvers:
 
 - `curl`: used for API calls and Google Drive filename detection.
-- `jq`: used to parse Gofile and SwissTransfer JSON.
+- `jq`: used to parse Gofile, SwissTransfer, and Transfer.it JSON.
 - `shasum`: used to SHA-256 hash Gofile passwords.
 - `base64`: used to encode SwissTransfer passwords.
 
 Optional:
 
-- `python3`: used only to URL-decode Google Drive filename hints. If missing,
-  the undecoded filename is used.
+- `python3`: used to URL-decode Google Drive filename hints, URL/base64url
+  encode Transfer.it filenames, and derive Transfer.it password tokens. If it is
+  missing, unprotected Transfer.it links still work, but filenames may fall back
+  to encoded text. Password-protected Transfer.it links require Python 3.
 
 On macOS, `curl`, `shasum`, and `base64` are normally already present. Install
 the common missing tools with:
@@ -544,7 +625,7 @@ Key functions:
 - `url_host`, `url_path`, `query_param`: small URL helpers implemented in Bash.
 - `host_matches`: safe domain matching for provider detection.
 - `is_pixeldrain`, `is_gofile`, `is_swisstransfer`, `is_gdrive`,
-  `is_seyarabata`: provider detectors.
+  `is_seyarabata`, `is_transferit`: provider detectors.
 - `is_torrent_like`: detects magnet links and `.torrent` paths/URLs.
 - `looks_like_source`: helps decide whether a second positional argument is a
   password or another source.
@@ -557,6 +638,9 @@ Key functions:
   when needed, and builds per-file API download URLs.
 - `resolve_seyarabata`: fetches the preview page, extracts the filename and
   `/d/FILE_ID` endpoint, and lets aria2 receive the fresh signed redirect.
+- `resolve_transferit`: calls Transfer.it's metadata, file-list, password
+  validation, and signed download URL APIs, then passes the signed CDN URL to
+  aria2.
 - `resolve_input`: dispatches one user argument to the right resolver.
 - `detect_conn_cap`: reads the local `aria2c` help output and detects the max
   connection cap.
@@ -671,13 +755,16 @@ part of normal use.
 
 ## Known Limitations
 
-- Provider APIs can change. If Gofile or SwissTransfer changes response shape or
-  token requirements, update the resolver and this README together.
+- Provider APIs can change. If Gofile, SwissTransfer, Transfer.it, or another
+  provider changes response shape or token requirements, update the resolver and
+  this README together.
 - Google Drive can still block files that require login, exceed quota, or show
   non-download interstitial pages.
 - Seyarabata support depends on the current `/t/FILE_ID` preview page and
   `/d/FILE_ID` redirect behavior.
-- Password support is implemented only for Gofile and SwissTransfer.
+- Transfer.it support depends on the current `xi`, `f`, `xv`, and `g` API
+  actions exposed by the Transfer.it web client.
+- Password support is implemented for Gofile, SwissTransfer, and Transfer.it.
 - The script downloads files only. It does not upload to Telegram, split files,
   or mirror media. That behavior belongs to the separate Telegram bot project.
 - No automatic cleanup is performed beyond what `aria2c` normally does.
@@ -708,6 +795,7 @@ Provider parity brought into `fastget`:
 Provider support added directly to `fastget` after the bot port:
 
 - `resolve_seyarabata`
+- `resolve_transferit`
 
 ## License
 
