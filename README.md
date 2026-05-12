@@ -36,6 +36,8 @@ Run downloads from this repo:
 ./fastget 'https://drive.google.com/file/d/FILE_ID/view'
 ./fastget -p 'secret' 'https://gofile.io/d/CONTENT_ID'
 ./fastget -p 'secret' 'https://www.swisstransfer.com/d/TRANSFER_ID'
+./fastget --interface en9 'https://example.com/huge-file.bin'
+./fastget --parallel 6 'https://example.com/a.bin' 'https://example.com/b.bin'
 ./fastget 'magnet:?xt=urn:btih:...'
 ./fastget ./something.torrent
 ```
@@ -55,6 +57,10 @@ Options:
 - `-o, --output NAME`: force the output filename when exactly one HTTP file is
   downloaded.
 - `-p, --password VALUE`: password for Gofile or SwissTransfer.
+- `--interface IFACE`: bind `aria2c` sockets to one interface. On the target
+  MacBook Pro, `en9` is the 10GbE Thunderbolt Ethernet interface.
+- `--parallel N`: number of resolved HTTP files to download in parallel. This
+  is most useful for Gofile/SwissTransfer folders or multiple direct URLs.
 - `-h, --help`: print usage.
 
 Password can also be supplied as:
@@ -97,12 +103,16 @@ For every input argument:
 2. If it recognizes a provider, it runs that provider resolver.
 3. The resolver appends one or more entries to internal arrays:
    `DL_URLS`, `DL_NAMES`, `DL_COOKIES`, `DL_ORIGINS`, and `DL_PROVIDERS`.
-4. After all inputs are resolved, each entry is downloaded with `download_one`.
-5. `download_one` chooses HTTP options or torrent options based on the final URL.
-6. `aria2c` performs the actual download.
+4. HTTP entries are batched together and downloaded through one aria2 input file
+   when `FASTGET_PARALLEL` is greater than 1.
+5. Torrent/magnet entries flush the HTTP batch and then run through the torrent
+   option path.
+6. `download_one` chooses HTTP options or torrent options based on the final URL.
+7. `aria2c` performs the actual download.
 
 This means one share link may become many downloads. For example, a Gofile
-folder containing five files resolves to five `aria2c` runs.
+folder containing five files resolves to five aria2 jobs, with up to
+`FASTGET_PARALLEL` of those jobs active at once in the aggressive profile.
 
 ## Provider Behavior
 
@@ -313,15 +323,19 @@ Behavior:
 
 ## Aria2 Profiles
 
-The script has two profiles.
+The script has two profiles. The default aggressive profile is tuned for the
+target machine this script is maintained on: Apple M4 Max, 128 GB RAM, 10GbE
+over `en9`, default route MTU 9000.
 
 Default aggressive profile:
 
 ```text
-ARIA_CONN=32
-ARIA_SPLIT=32
-ARIA_CHUNK=4M
-ARIA_CACHE=512M
+ARIA_CONN=<detected aria2 per-server cap, usually 16>
+ARIA_SPLIT=64
+ARIA_CHUNK=16M
+ARIA_CACHE=2048M
+ARIA_FILE_ALLOCATION=trunc
+FASTGET_PARALLEL=4
 ```
 
 Sane profile:
@@ -329,29 +343,81 @@ Sane profile:
 ```text
 ARIA_CONN=16
 ARIA_SPLIT=16
-ARIA_CHUNK=2M
-ARIA_CACHE=256M
+ARIA_CHUNK=4M
+ARIA_CACHE=512M
+ARIA_FILE_ALLOCATION=none
+FASTGET_PARALLEL=1
 ```
 
 `aria2c` usually caps `--max-connection-per-server` at 16. `fastget` detects the
 installed cap and clamps `ARIA_CONN` if needed.
+
+The aggressive profile deliberately uses a much larger disk cache than aria2's
+default. `aria2c` accepts `K` and `M` suffixes for `--disk-cache`, so the script
+uses `2048M` instead of `2G`.
 
 Shared defaults:
 
 ```text
 ARIA_TRIES=0
 ARIA_WAIT=5
+ARIA_CONNECT_TIMEOUT=15
+ARIA_TIMEOUT=60
+ARIA_SUMMARY_INTERVAL=5
+ARIA_NO_CONF=true
+ARIA_DISABLE_IPV6=false
 ARIA_BT_STOP_TIMEOUT=300
 ARIA_BT_MAX_PEERS=100
 ```
 
 `ARIA_TRIES=0` means unlimited retry attempts in aria2.
 
+## 10GbE / Jumbo Frame Notes
+
+The local machine checked during this tuning pass had:
+
+```text
+CPU: Apple M4 Max
+Memory: 128 GB
+Default route: en9
+en9 media: 10Gbase-T full-duplex
+en9 MTU: 9000
+aria2: 1.37.0 with Async DNS, HTTPS, BitTorrent, Metalink, and mmap support
+```
+
+`fastget` does not set MTU. TCP uses the route/interface MTU selected by macOS.
+For this machine the default IPv4 route was already using `en9` at MTU 9000, so
+ordinary `fastget URL` traffic should use the jumbo-frame 10GbE path.
+
+When Wi-Fi or VPN routing is also active, force the 10GbE interface explicitly:
+
+```bash
+./fastget --interface en9 'https://example.com/huge-file.bin'
+FASTGET_INTERFACE=en9 ./fastget 'https://example.com/huge-file.bin'
+```
+
+The script also raises its soft file descriptor limit to
+`FASTGET_ULIMIT_NOFILE=8192` by default. The checked shell had a soft limit of
+256 and an unlimited hard limit, so raising the limit inside the process is
+important for parallel provider folders and aggressive segmented downloads.
+
+The macOS TCP autotune buffer values observed were 4 MiB max receive/send
+autotune buffers. With aria2's 16 per-server connection cap, this is generally
+enough to fill 10GbE on local/low-latency paths. Very high-latency WAN paths may
+still be limited by remote server policy, TCP windows, packet loss, CDN region,
+or provider throttling.
+
 ## Environment Variables
 
 General:
 
 - `FASTGET_PASSWORD`: fallback password for Gofile or SwissTransfer.
+- `FASTGET_INTERFACE`: optional aria2 socket binding interface, for example
+  `en9` for the 10GbE Thunderbolt Ethernet port.
+- `FASTGET_PARALLEL`: parallel HTTP file downloads after provider resolution.
+  Default is `4` aggressive and `1` sane.
+- `FASTGET_ULIMIT_NOFILE`: runtime soft file descriptor target. Default is
+  `8192`.
 - `FASTGET_USER_AGENT`: HTTP user agent. Default is `Mozilla/5.0`.
 - `FASTGET_CONNECT_TIMEOUT`: API connection timeout for `curl`. Default is `20`.
 - `FASTGET_API_TIMEOUT`: total API timeout for `curl`. Default is `60`.
@@ -362,8 +428,17 @@ HTTP/aria2 tuning:
 - `ARIA_SPLIT`: split count.
 - `ARIA_CHUNK`: min split size and piece length.
 - `ARIA_CACHE`: aria2 disk cache size.
+- `ARIA_FILE_ALLOCATION`: file allocation method. Default is `trunc` aggressive
+  and `none` sane.
 - `ARIA_TRIES`: max tries.
 - `ARIA_WAIT`: seconds between retries.
+- `ARIA_CONNECT_TIMEOUT`: aria2 connect timeout. Default is `15`.
+- `ARIA_TIMEOUT`: aria2 socket timeout after connection. Default is `60`.
+- `ARIA_SUMMARY_INTERVAL`: aria2 progress summary interval. Default is `5`.
+- `ARIA_NO_CONF`: when `true`, passes `--no-conf=true` so hidden aria2 config
+  cannot throttle fastget. Default is `true`.
+- `ARIA_DISABLE_IPV6`: when `true`, passes `--disable-ipv6=true`. Default is
+  `false`.
 
 Gofile:
 
@@ -380,6 +455,7 @@ Example:
 
 ```bash
 ARIA_CONN=8 ARIA_SPLIT=8 ./fastget --sane 'https://example.com/file.zip'
+FASTGET_INTERFACE=en9 FASTGET_PARALLEL=6 ./fastget 'https://example.com/a.bin' 'https://example.com/b.bin'
 ARIA_BT_STOP_TIMEOUT=600 ./fastget 'magnet:?xt=urn:btih:...'
 ```
 
@@ -417,6 +493,8 @@ Key functions:
 
 - `usage`: command help and documented interface.
 - `need_tool`: dependency checks with install hints.
+- `raise_fd_limit`: raises the process soft file descriptor limit for aggressive
+  parallel downloads when the shell starts with a small limit.
 - `url_host`, `url_path`, `query_param`: small URL helpers implemented in Bash.
 - `host_matches`: safe domain matching for provider detection.
 - `is_pixeldrain`, `is_gofile`, `is_swisstransfer`, `is_gdrive`: provider
@@ -437,6 +515,9 @@ Key functions:
 - `has_opt`: checks whether the installed `aria2c` supports an option before
   using it.
 - `download_one`: chooses HTTP or torrent options and runs `aria2c`.
+- `batch_add_http`, `flush_http_batch`, `download_http_batch`: collect resolved
+  HTTP downloads and feed them to aria2 input-file mode for parallel
+  multi-file downloads.
 
 Internal arrays:
 
@@ -445,6 +526,9 @@ Internal arrays:
 - `DL_COOKIES`: optional cookie strings, currently used by Gofile.
 - `DL_ORIGINS`: original user inputs. Kept for future diagnostics.
 - `DL_PROVIDERS`: provider labels used in status output.
+- `BATCH_URLS`, `BATCH_NAMES`, `BATCH_COOKIES`, `BATCH_PROVIDERS`: temporary
+  HTTP batch arrays used before the next torrent/magnet boundary or final
+  flush.
 
 Do not collapse these arrays into a single string format unless you also handle
 tabs, spaces, quotes, and newlines in filenames and URLs. Bash arrays are used
@@ -472,7 +556,8 @@ Resolver rules:
 - Avoid parsing JSON with `sed`, `awk`, or `grep`.
 - Keep passwords out of status output.
 - If a provider can resolve multiple files, append multiple jobs rather than
-  trying to combine them into one `aria2c` call.
+  trying to combine them inside the resolver. The HTTP batch layer handles
+  parallel aria2 execution.
 - If a provider requires a changing token, add an environment override for it.
 
 Torrent rules:
@@ -491,6 +576,9 @@ Bash compatibility rules:
 - Use arrays for arguments passed to `aria2c`.
 - Quote variable expansions.
 - Avoid building command strings and `eval`.
+- Keep the aria2 input-file writer inside `download_http_batch` careful and
+  boring: one URL line, then indented per-download options such as `out=` and
+  `header=`.
 
 ## Verification
 
@@ -517,6 +605,14 @@ cd /tmp
 rm -f /tmp/fastget-test-readme.txt /tmp/fastget-test-readme.txt.aria2
 ```
 
+Parallel local HTTP smoke test:
+
+```bash
+cd /tmp
+/path/to/fastget --parallel 2 http://127.0.0.1:8765/README.md http://127.0.0.1:8765/LICENSE
+rm -f /tmp/README.md /tmp/README.md.aria2 /tmp/LICENSE /tmp/LICENSE.aria2
+```
+
 Provider tests require real links. Prefer small test files because `fastget`
 will download the full resolved file.
 
@@ -530,6 +626,9 @@ will download the full resolved file.
 - The script downloads files only. It does not upload to Telegram, split files,
   or mirror media. That behavior belongs to the separate Telegram bot project.
 - No automatic cleanup is performed beyond what `aria2c` normally does.
+- A single remote server can still be the bottleneck. The script asks aria2 for
+  the local maximum, but remote CDNs and file hosts may cap per-IP, per-file, or
+  per-account throughput.
 
 ## Relationship to the Telegram Bot
 

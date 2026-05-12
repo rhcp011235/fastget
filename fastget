@@ -9,6 +9,8 @@ PROGRAM="${0##*/}"
 PROFILE="aggressive"
 OUT_NAME=""
 PASSWORD="${FASTGET_PASSWORD:-}"
+FASTGET_INTERFACE="${FASTGET_INTERFACE:-}"
+FASTGET_PARALLEL="${FASTGET_PARALLEL:-}"
 INPUTS=()
 
 usage() {
@@ -20,6 +22,8 @@ Examples:
   ${PROGRAM} https://example.com/file.zip
   ${PROGRAM} -o file.zip https://example.com/download
   ${PROGRAM} -p secret https://www.swisstransfer.com/d/<id>
+  ${PROGRAM} --interface en9 https://example.com/huge.bin
+  ${PROGRAM} --parallel 6 https://example.com/a.bin https://example.com/b.bin
   ${PROGRAM} "magnet:?xt=urn:btih:..."
   ${PROGRAM} ./file.torrent
 
@@ -32,14 +36,20 @@ Options:
   --aggressive           Use the default aggressive aria2 profile.
   -o, --output NAME      Output filename. Used only when one HTTP file resolves.
   -p, --password VALUE   Password for Gofile or SwissTransfer links.
+  --interface IFACE      Bind aria2 sockets to an interface, e.g. en9 for 10GbE.
+  --parallel N           Parallel HTTP files after provider resolution.
   -h, --help             Show this help.
 
 Environment:
   FASTGET_PASSWORD       Password fallback for protected hosts.
+  FASTGET_INTERFACE      Optional aria2 socket binding interface.
+  FASTGET_PARALLEL       Parallel HTTP file downloads, default 4 aggressive.
+  FASTGET_ULIMIT_NOFILE  Runtime file descriptor soft limit, default 8192.
   ARIA_CONN              Connections per server before aria2 cap clamping.
   ARIA_SPLIT             aria2 split count.
   ARIA_CHUNK             aria2 min split and piece size.
   ARIA_CACHE             aria2 disk cache size.
+  ARIA_FILE_ALLOCATION   aria2 file allocation method, default trunc aggressive.
   ARIA_TRIES             aria2 max tries, default 0 (unlimited).
   ARIA_WAIT              aria2 retry wait seconds.
   ARIA_BT_TRACKERS       Comma-separated extra BitTorrent trackers.
@@ -64,6 +74,32 @@ need_tool() {
       die "Missing required tool: ${tool}. ${hint}"
     fi
     die "Missing required tool: ${tool}"
+  fi
+}
+
+is_uint() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+raise_fd_limit() {
+  local requested current
+  requested="${FASTGET_ULIMIT_NOFILE:-8192}"
+
+  is_uint "$requested" || die "FASTGET_ULIMIT_NOFILE must be a number"
+  [ "$requested" -gt 0 ] || return 0
+
+  current="$(ulimit -n)"
+  if [ "$current" = "unlimited" ]; then
+    return 0
+  fi
+
+  if is_uint "$current" && [ "$current" -lt "$requested" ]; then
+    if ! ulimit -n "$requested" 2>/dev/null; then
+      note "could not raise file descriptor limit from ${current} to ${requested}"
+    fi
   fi
 }
 
@@ -575,6 +611,75 @@ download_one() {
   aria2c "${opts[@]}" "$url"
 }
 
+batch_add_http() {
+  local i="${#BATCH_URLS[@]}"
+  BATCH_URLS[$i]="$1"
+  BATCH_NAMES[$i]="$2"
+  BATCH_COOKIES[$i]="$3"
+  BATCH_PROVIDERS[$i]="$4"
+}
+
+reset_http_batch() {
+  BATCH_URLS=()
+  BATCH_NAMES=()
+  BATCH_COOKIES=()
+  BATCH_PROVIDERS=()
+}
+
+download_http_batch() {
+  local count="$1"
+  local input_file rc idx url name cookie provider
+  local opts
+
+  if [ "$count" -eq 0 ]; then
+    return 0
+  fi
+
+  if [ "$count" -eq 1 ] || [ "$FASTGET_PARALLEL" -le 1 ]; then
+    idx=0
+    while [ "$idx" -lt "$count" ]; do
+      download_one "${BATCH_URLS[$idx]}" "${BATCH_NAMES[$idx]}" "${BATCH_COOKIES[$idx]}" "${BATCH_PROVIDERS[$idx]}"
+      idx=$((idx + 1))
+    done
+    return 0
+  fi
+
+  input_file="$(mktemp "${TMPDIR:-/tmp}/fastget.XXXXXX")" || die "Could not create temporary aria2 input file"
+  idx=0
+  while [ "$idx" -lt "$count" ]; do
+    url="${BATCH_URLS[$idx]}"
+    name="${BATCH_NAMES[$idx]}"
+    cookie="${BATCH_COOKIES[$idx]}"
+    {
+      printf '%s\n' "$url"
+      if [ -n "$name" ]; then
+        printf '  out=%s\n' "$name"
+      fi
+      if [ -n "$cookie" ]; then
+        printf '  header=Cookie: %s\n' "$cookie"
+      fi
+    } >>"$input_file"
+    idx=$((idx + 1))
+  done
+
+  opts=("${COMMON_OPTS[@]}" "${HTTP_OPTS[@]}" --max-concurrent-downloads="${FASTGET_PARALLEL}")
+  has_opt "--deferred-input" && opts+=( --deferred-input=true )
+
+  echo "Downloading ${count} HTTP files with up to ${FASTGET_PARALLEL} parallel jobs" >&2
+  set +e
+  aria2c "${opts[@]}" --input-file="$input_file"
+  rc=$?
+  set -e
+  rm -f "$input_file"
+  return "$rc"
+}
+
+flush_http_batch() {
+  local count="${#BATCH_URLS[@]}"
+  download_http_batch "$count"
+  reset_http_batch
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --sane)
@@ -601,6 +706,24 @@ while [ "$#" -gt 0 ]; do
       ;;
     --password=*)
       PASSWORD="${1#*=}"
+      shift
+      ;;
+    --interface)
+      [ "$#" -ge 2 ] || die "$1 requires an interface value"
+      FASTGET_INTERFACE="$2"
+      shift 2
+      ;;
+    --interface=*)
+      FASTGET_INTERFACE="${1#*=}"
+      shift
+      ;;
+    --parallel)
+      [ "$#" -ge 2 ] || die "$1 requires a number"
+      FASTGET_PARALLEL="$2"
+      shift 2
+      ;;
+    --parallel=*)
+      FASTGET_PARALLEL="${1#*=}"
       shift
       ;;
     -h|--help)
@@ -640,31 +763,51 @@ ARIA_HELP="$(aria2c -h#all 2>/dev/null || aria2c -h 2>/dev/null || true)"
 ARIA_CONN_CAP="$(detect_conn_cap)"
 
 if [ "$PROFILE" = "aggressive" ]; then
-  ARIA_CONN="${ARIA_CONN:-32}"
-  ARIA_SPLIT="${ARIA_SPLIT:-32}"
-  ARIA_CHUNK="${ARIA_CHUNK:-4M}"
-  ARIA_CACHE="${ARIA_CACHE:-512M}"
+  ARIA_CONN="${ARIA_CONN:-$ARIA_CONN_CAP}"
+  ARIA_SPLIT="${ARIA_SPLIT:-64}"
+  ARIA_CHUNK="${ARIA_CHUNK:-16M}"
+  ARIA_CACHE="${ARIA_CACHE:-2048M}"
+  ARIA_FILE_ALLOCATION="${ARIA_FILE_ALLOCATION:-trunc}"
+  FASTGET_PARALLEL="${FASTGET_PARALLEL:-4}"
 else
   ARIA_CONN="${ARIA_CONN:-16}"
   ARIA_SPLIT="${ARIA_SPLIT:-16}"
-  ARIA_CHUNK="${ARIA_CHUNK:-2M}"
-  ARIA_CACHE="${ARIA_CACHE:-256M}"
+  ARIA_CHUNK="${ARIA_CHUNK:-4M}"
+  ARIA_CACHE="${ARIA_CACHE:-512M}"
+  ARIA_FILE_ALLOCATION="${ARIA_FILE_ALLOCATION:-none}"
+  FASTGET_PARALLEL="${FASTGET_PARALLEL:-1}"
 fi
 ARIA_TRIES="${ARIA_TRIES:-0}"
 ARIA_WAIT="${ARIA_WAIT:-5}"
+ARIA_CONNECT_TIMEOUT="${ARIA_CONNECT_TIMEOUT:-15}"
+ARIA_TIMEOUT="${ARIA_TIMEOUT:-60}"
+ARIA_SUMMARY_INTERVAL="${ARIA_SUMMARY_INTERVAL:-5}"
+ARIA_NO_CONF="${ARIA_NO_CONF:-true}"
+ARIA_DISABLE_IPV6="${ARIA_DISABLE_IPV6:-false}"
 ARIA_BT_STOP_TIMEOUT="${ARIA_BT_STOP_TIMEOUT:-300}"
 ARIA_BT_MAX_PEERS="${ARIA_BT_MAX_PEERS:-100}"
 ARIA_BT_TRACKERS="${ARIA_BT_TRACKERS:-udp://tracker.opentrackr.org:1337/announce,udp://open.stealth.si:80/announce,udp://tracker.torrent.eu.org:451/announce}"
 FASTGET_USER_AGENT="${FASTGET_USER_AGENT:-Mozilla/5.0}"
 
-case "$ARIA_CONN" in
-  ''|*[!0-9]*) die "ARIA_CONN must be a number" ;;
-esac
+is_uint "$ARIA_CONN" || die "ARIA_CONN must be a number"
+is_uint "$ARIA_SPLIT" || die "ARIA_SPLIT must be a number"
+is_uint "$ARIA_TRIES" || die "ARIA_TRIES must be a number"
+is_uint "$ARIA_WAIT" || die "ARIA_WAIT must be a number"
+is_uint "$ARIA_CONNECT_TIMEOUT" || die "ARIA_CONNECT_TIMEOUT must be a number"
+is_uint "$ARIA_TIMEOUT" || die "ARIA_TIMEOUT must be a number"
+is_uint "$ARIA_SUMMARY_INTERVAL" || die "ARIA_SUMMARY_INTERVAL must be a number"
+is_uint "$FASTGET_PARALLEL" || die "FASTGET_PARALLEL must be a number"
+is_uint "$ARIA_BT_STOP_TIMEOUT" || die "ARIA_BT_STOP_TIMEOUT must be a number"
+is_uint "$ARIA_BT_MAX_PEERS" || die "ARIA_BT_MAX_PEERS must be a number"
+
+[ "$FASTGET_PARALLEL" -gt 0 ] || die "FASTGET_PARALLEL must be greater than 0"
 
 if [ "$ARIA_CONN" -gt "$ARIA_CONN_CAP" ]; then
   note "clamping --max-connection-per-server from ${ARIA_CONN} to ${ARIA_CONN_CAP}"
   ARIA_CONN="$ARIA_CONN_CAP"
 fi
+
+raise_fd_limit
 
 COMMON_OPTS=(
   --continue=true
@@ -673,15 +816,21 @@ COMMON_OPTS=(
   --min-split-size="${ARIA_CHUNK}"
   --piece-length="${ARIA_CHUNK}"
   --disk-cache="${ARIA_CACHE}"
-  --file-allocation=none
+  --file-allocation="${ARIA_FILE_ALLOCATION}"
   --auto-file-renaming=false
   --retry-wait="${ARIA_WAIT}"
   --max-tries="${ARIA_TRIES}"
+  --connect-timeout="${ARIA_CONNECT_TIMEOUT}"
+  --timeout="${ARIA_TIMEOUT}"
+  --max-overall-download-limit=0
+  --max-download-limit=0
   --uri-selector=inorder
   --console-log-level=warn
-  --summary-interval=3
+  --summary-interval="${ARIA_SUMMARY_INTERVAL}"
   --reuse-uri=true
   --check-certificate=true
+  --always-resume=false
+  --max-resume-failure-tries=1
 )
 
 HTTP_OPTS=(
@@ -703,7 +852,19 @@ TORRENT_OPTS=(
 
 has_opt "--enable-mmap" && COMMON_OPTS+=( --enable-mmap=true )
 has_opt "--async-dns" && COMMON_OPTS+=( --async-dns=true )
+has_opt "--allow-piece-length-change" && COMMON_OPTS+=( --allow-piece-length-change=true )
+if [ "$ARIA_NO_CONF" = "true" ] && has_opt "--no-conf"; then
+  COMMON_OPTS+=( --no-conf=true )
+fi
+if [ "$ARIA_DISABLE_IPV6" = "true" ] && has_opt "--disable-ipv6"; then
+  COMMON_OPTS+=( --disable-ipv6=true )
+fi
+if [ -n "$FASTGET_INTERFACE" ]; then
+  has_opt "--interface" || die "Installed aria2c does not support --interface"
+  COMMON_OPTS+=( --interface="$FASTGET_INTERFACE" )
+fi
 has_opt "--content-disposition-default-utf8" && HTTP_OPTS+=( --content-disposition-default-utf8=true )
+has_opt "--enable-http-keep-alive" && HTTP_OPTS+=( --enable-http-keep-alive=true )
 has_opt "--follow-torrent" && TORRENT_OPTS+=( --follow-torrent=mem )
 has_opt "--bt-tracker" && TORRENT_OPTS+=( --bt-tracker="${ARIA_BT_TRACKERS}" )
 
@@ -712,6 +873,7 @@ DL_NAMES=()
 DL_COOKIES=()
 DL_ORIGINS=()
 DL_PROVIDERS=()
+reset_http_batch
 
 for input in "${INPUTS[@]}"; do
   resolve_input "$input"
@@ -731,6 +893,13 @@ while [ "$idx" -lt "${#DL_URLS[@]}" ]; do
     output_name="${DL_NAMES[$idx]}"
   fi
 
-  download_one "$url" "$output_name" "${DL_COOKIES[$idx]}" "${DL_PROVIDERS[$idx]}"
+  if is_torrent_like "$url"; then
+    flush_http_batch
+    download_one "$url" "$output_name" "${DL_COOKIES[$idx]}" "${DL_PROVIDERS[$idx]}"
+  else
+    batch_add_http "$url" "$output_name" "${DL_COOKIES[$idx]}" "${DL_PROVIDERS[$idx]}"
+  fi
   idx=$((idx + 1))
 done
+
+flush_http_batch
