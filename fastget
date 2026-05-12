@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # fastget - universal aria2c wrapper with host resolvers.
 # Supports direct URLs, Pixeldrain, Gofile, SwissTransfer, Google Drive,
-# Seyarabata, magnet links, and local/remote .torrent files.
+# Seyarabata, Transfer.it, magnet links, and local/remote .torrent files.
 
 set -euo pipefail
 
@@ -22,6 +22,7 @@ Examples:
   ${PROGRAM} https://example.com/file.zip
   ${PROGRAM} -o file.zip https://example.com/download
   ${PROGRAM} -p secret https://www.swisstransfer.com/d/<id>
+  ${PROGRAM} https://transfer.it/t/<id>
   ${PROGRAM} --interface en9 https://example.com/huge.bin
   ${PROGRAM} --parallel 6 https://example.com/a.bin https://example.com/b.bin
   ${PROGRAM} "magnet:?xt=urn:btih:..."
@@ -29,13 +30,13 @@ Examples:
 
 Supported:
   direct HTTP(S), Pixeldrain, Gofile, SwissTransfer, Google Drive, Seyarabata,
-  magnet links, local .torrent files, and remote .torrent URLs.
+  Transfer.it, magnet links, local .torrent files, and remote .torrent URLs.
 
 Options:
   --sane                 Use a less aggressive aria2 profile.
   --aggressive           Use the default aggressive aria2 profile.
   -o, --output NAME      Output filename. Used only when one HTTP file resolves.
-  -p, --password VALUE   Password for Gofile or SwissTransfer links.
+  -p, --password VALUE   Password for Gofile, SwissTransfer, or Transfer.it.
   --interface IFACE      Bind aria2 sockets to an interface, e.g. en9 for 10GbE.
   --parallel N           Parallel HTTP files after provider resolution.
   -h, --help             Show this help.
@@ -54,6 +55,7 @@ Environment:
   ARIA_WAIT              aria2 retry wait seconds.
   ARIA_BT_TRACKERS       Comma-separated extra BitTorrent trackers.
   ARIA_BT_STOP_TIMEOUT   Stop torrent if speed is 0 for this many seconds.
+  FASTGET_TRANSFERIT_API Transfer.it API base, default https://bt7.api.mega.co.nz.
 EOF
 }
 
@@ -227,8 +229,17 @@ is_seyarabata() {
   esac
 }
 
+is_transferit() {
+  local host
+  host="$(url_host "$1")"
+  case "$host" in
+    transfer.it|www.transfer.it) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 is_password_provider() {
-  is_gofile "$1" || is_swisstransfer "$1"
+  is_gofile "$1" || is_swisstransfer "$1" || is_transferit "$1"
 }
 
 is_torrent_like() {
@@ -275,6 +286,33 @@ url_decode_if_possible() {
   fi
 }
 
+url_encode_if_possible() {
+  local value="$1"
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$value" 2>/dev/null || printf '%s' "$value"
+  else
+    printf '%s' "$value"
+  fi
+}
+
+base64url_decode_if_possible() {
+  local value="$1"
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import base64
+import sys
+
+value = sys.argv[1].strip()
+value += "=" * (-len(value) % 4)
+sys.stdout.write(base64.urlsafe_b64decode(value).decode("utf-8", "replace"))
+' "$value" 2>/dev/null || printf '%s' "$value"
+  else
+    printf '%s' "$value"
+  fi
+}
+
 html_decode_if_possible() {
   local value="$1"
 
@@ -297,6 +335,58 @@ json_value() {
 
 sha256_hex() {
   printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
+}
+
+transferit_password_token() {
+  local xh="$1"
+  local password="$2"
+
+  need_tool python3 "Install it with: brew install python"
+  python3 - "$xh" "$password" <<'PY'
+import base64
+import hashlib
+import sys
+
+xh = sys.argv[1]
+password = sys.argv[2]
+
+
+def b64url_decode(value):
+    if isinstance(value, str):
+        value = value.encode("ascii")
+    value += b"=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value)
+
+
+try:
+    if len(xh) > 12:
+        seed = b64url_decode(b64url_decode(xh))[-7:-1]
+    else:
+        seed = b64url_decode(xh)[-6:]
+    salt = seed * 3
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.strip().encode("utf-8"),
+        salt,
+        100000,
+        32,
+    )
+    print(base64.urlsafe_b64encode(digest).decode("ascii").rstrip("="))
+except Exception as exc:
+    raise SystemExit(f"failed to derive Transfer.it password token: {exc}")
+PY
+}
+
+transferit_api_error() {
+  jq -r '
+    if type == "array" and length > 0 and (.[0] | type) == "number" then
+      .[0]
+    elif type == "number" then
+      .
+    else
+      empty
+    end
+  '
 }
 
 append_download() {
@@ -468,6 +558,157 @@ resolve_seyarabata() {
     note "Seyarabata: resolved ${filename}"
   else
     note "Seyarabata: resolved download endpoint"
+  fi
+}
+
+resolve_transferit() {
+  local url="$1"
+  local path xh api_base info_payload info_json api_error info pw_required password_token
+  local validate_payload validate_json validate_result api_query title_token filename files_count
+  local zip_node node node_kind file_payload file_json g_payload g_json g_base encoded_filename
+  local download_url
+
+  need_tool curl "macOS normally includes curl."
+  need_tool jq "Install it with: brew install jq"
+
+  path="$(url_path "$url")"
+  path="${path#/}"
+  case "$path" in
+    t/*)
+      xh="${path#t/}"
+      xh="${xh%%/*}"
+      ;;
+    *)
+      die "Invalid Transfer.it URL. Expected transfer.it/t/<id>"
+      ;;
+  esac
+
+  [ -n "$xh" ] || die "Could not extract Transfer.it transfer ID from: ${url}"
+
+  api_base="${FASTGET_TRANSFERIT_API:-https://bt7.api.mega.co.nz}"
+  api_base="${api_base%/}"
+  note "Transfer.it: resolving transfer ${xh}"
+
+  info_payload="$(jq -cn --arg xh "$xh" '[{a:"xi", xh:$xh}]')"
+  if ! info_json="$(curl_json \
+      -H "Content-Type: application/json" \
+      --data "$info_payload" \
+      "${api_base}/cs?id=0")"; then
+    die "Transfer.it metadata request failed"
+  fi
+
+  api_error="$(printf '%s' "$info_json" | transferit_api_error)"
+  [ -z "$api_error" ] || die "Transfer.it metadata API returned error ${api_error}"
+
+  info="$(printf '%s' "$info_json" | jq -c 'if type == "array" then .[0] else . end')"
+  [ "$(printf '%s' "$info" | jq -r 'type')" = "object" ] || die "Transfer.it metadata response was not an object"
+
+  pw_required="$(json_value "$info" '.pw // false')"
+  password_token=""
+  if [ "$pw_required" = "true" ] || [ "$pw_required" = "1" ]; then
+    [ -n "$PASSWORD" ] || die "Transfer.it link requires a password. Use -p password."
+    password_token="$(transferit_password_token "$xh" "$PASSWORD")"
+
+    validate_payload="$(jq -cn \
+      --arg xh "$xh" \
+      --arg pw "$password_token" \
+      '[{a:"xv", xh:$xh, pw:$pw}]')"
+    if ! validate_json="$(curl_json \
+        -H "Content-Type: application/json" \
+        --data "$validate_payload" \
+        "${api_base}/cs?id=0")"; then
+      die "Transfer.it password validation request failed"
+    fi
+
+    api_error="$(printf '%s' "$validate_json" | transferit_api_error)"
+    [ -z "$api_error" ] || die "Transfer.it password validation returned error ${api_error}"
+
+    validate_result="$(printf '%s' "$validate_json" | jq -r 'if type == "array" then .[0] else . end')"
+    [ "$validate_result" = "1" ] || die "Invalid Transfer.it password"
+  fi
+
+  title_token="$(json_value "$info" '.t // empty')"
+  filename=""
+  if [ -n "$title_token" ] && [ "$title_token" != "null" ]; then
+    filename="$(base64url_decode_if_possible "$title_token")"
+    filename="$(sanitize_provider_name "$filename")"
+  fi
+
+  files_count="$(json_value "$info" '.size[1] // 0')"
+  is_uint "$files_count" || files_count=0
+  zip_node="$(json_value "$info" '.z // empty')"
+  node=""
+  node_kind="file"
+
+  if [ "$files_count" -ne 1 ] && [ -n "$zip_node" ] && [ "$zip_node" != "null" ]; then
+    node="$zip_node"
+    node_kind="zip"
+    if [ -z "$filename" ]; then
+      filename="${xh}-${node}.zip"
+    else
+      case "$(lower "$filename")" in
+        *.zip) ;;
+        *) filename="${filename}.zip" ;;
+      esac
+    fi
+  elif [ "$files_count" -gt 1 ]; then
+    die "Transfer.it multi-file transfer did not include a downloadable archive node"
+  else
+    api_query="x=${xh}"
+    if [ -n "$password_token" ]; then
+      api_query="${api_query}&pw=${password_token}"
+    fi
+
+    file_payload='[{"a":"f","c":1,"r":1}]'
+    if ! file_json="$(curl_json \
+        -H "Content-Type: application/json" \
+        --data "$file_payload" \
+        "${api_base}/cs?id=0&${api_query}")"; then
+      die "Transfer.it file-list request failed"
+    fi
+
+    api_error="$(printf '%s' "$file_json" | transferit_api_error)"
+    [ -z "$api_error" ] || die "Transfer.it file-list API returned error ${api_error}"
+
+    node="$(printf '%s' "$file_json" | jq -r '
+      ((if type == "array" then .[0].f else .f end) // [])
+      | map(select((.t // 1) == 0 and ((.h // "") != "")))
+      | .[0].h // empty
+    ')"
+    [ -n "$node" ] || die "No downloadable file node found in Transfer.it link"
+
+    if [ -z "$filename" ]; then
+      filename="${xh}-${node}.bin"
+    fi
+  fi
+
+  g_payload="$(jq -cn --arg n "$node" '[{a:"g", n:$n, pt:1, g:1, ssl:1}]')"
+  api_query="x=${xh}"
+  if [ -n "$password_token" ]; then
+    api_query="${api_query}&pw=${password_token}"
+  fi
+
+  if ! g_json="$(curl_json \
+      -H "Content-Type: application/json" \
+      --data "$g_payload" \
+      "${api_base}/cs?id=0&${api_query}")"; then
+    die "Transfer.it download URL request failed"
+  fi
+
+  api_error="$(printf '%s' "$g_json" | transferit_api_error)"
+  [ -z "$api_error" ] || die "Transfer.it download URL API returned error ${api_error}"
+
+  g_base="$(printf '%s' "$g_json" | jq -r 'if type == "array" then .[0].g // empty else .g // empty end')"
+  [ -n "$g_base" ] && [ "$g_base" != "null" ] || die "Transfer.it response did not include a downloadable URL"
+
+  encoded_filename="$(url_encode_if_possible "$filename")"
+  download_url="${g_base%/}/${encoded_filename}"
+
+  append_download "$download_url" "$filename" "" "$url" "transferit"
+  if [ "$node_kind" = "zip" ]; then
+    note "Transfer.it: resolved transfer archive ${filename}"
+  else
+    note "Transfer.it: resolved ${filename}"
   fi
 }
 
@@ -649,6 +890,8 @@ resolve_input() {
     resolve_gdrive "$item"
   elif is_seyarabata "$item"; then
     resolve_seyarabata "$item"
+  elif is_transferit "$item"; then
+    resolve_transferit "$item"
   else
     if is_torrent_like "$item" && ! has_uri_scheme "$item"; then
       case "$(lower "$item")" in
