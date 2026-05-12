@@ -1,50 +1,645 @@
 #!/usr/bin/env bash
-# fastget — universal aria2c wrapper with auto feature detection
-# Usage:
-#   fastget <url> [more_urls...]
-#   fastget -o file.zip <url>
-#   fastget --sane <url>    # less aggressive profile
+# fastget - universal aria2c wrapper with host resolvers.
+# Supports direct URLs, Pixeldrain, Gofile, SwissTransfer, Google Drive,
+# magnet links, and local/remote .torrent files.
 
 set -euo pipefail
 
+PROGRAM="${0##*/}"
 PROFILE="aggressive"
 OUT_NAME=""
-if [[ "${1:-}" == "--sane" ]]; then
-  PROFILE="sane"
-  shift
-fi
+PASSWORD="${FASTGET_PASSWORD:-}"
+INPUTS=()
 
-while getopts ":o:" opt; do
-  case "$opt" in
-    o) OUT_NAME="$OPTARG" ;;
-    *) echo "Usage: $0 [--sane] [-o output] <url> [more_urls...]"; exit 1 ;;
-  esac
-done
-shift $((OPTIND - 1))
+usage() {
+  cat <<EOF
+Usage:
+  ${PROGRAM} [--sane] [-o output] [-p password] <url-or-torrent> [more...]
 
-if ! command -v aria2c >/dev/null 2>&1; then
-  echo "Error: aria2c not found. Install it first (brew install aria2 on macOS)." >&2
-  exit 127
-fi
+Examples:
+  ${PROGRAM} https://example.com/file.zip
+  ${PROGRAM} -o file.zip https://example.com/download
+  ${PROGRAM} -p secret https://www.swisstransfer.com/d/<id>
+  ${PROGRAM} "magnet:?xt=urn:btih:..."
+  ${PROGRAM} ./file.torrent
 
-if [ "$#" -lt 1 ]; then
-  echo "Usage: $0 [--sane] [-o output] <url> [more_urls...]"
+Supported:
+  direct HTTP(S), Pixeldrain, Gofile, SwissTransfer, Google Drive file links,
+  magnet links, local .torrent files, and remote .torrent URLs.
+
+Options:
+  --sane                 Use a less aggressive aria2 profile.
+  --aggressive           Use the default aggressive aria2 profile.
+  -o, --output NAME      Output filename. Used only when one HTTP file resolves.
+  -p, --password VALUE   Password for Gofile or SwissTransfer links.
+  -h, --help             Show this help.
+
+Environment:
+  FASTGET_PASSWORD       Password fallback for protected hosts.
+  ARIA_CONN              Connections per server before aria2 cap clamping.
+  ARIA_SPLIT             aria2 split count.
+  ARIA_CHUNK             aria2 min split and piece size.
+  ARIA_CACHE             aria2 disk cache size.
+  ARIA_TRIES             aria2 max tries, default 0 (unlimited).
+  ARIA_WAIT              aria2 retry wait seconds.
+  ARIA_BT_TRACKERS       Comma-separated extra BitTorrent trackers.
+  ARIA_BT_STOP_TIMEOUT   Stop torrent if speed is 0 for this many seconds.
+EOF
+}
+
+die() {
+  echo "Error: $*" >&2
   exit 1
-fi
+}
 
-# Detect max cap for --max-connection-per-server (usually 16)
+note() {
+  echo "Note: $*" >&2
+}
+
+need_tool() {
+  local tool="$1"
+  local hint="${2-}"
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    if [ -n "$hint" ]; then
+      die "Missing required tool: ${tool}. ${hint}"
+    fi
+    die "Missing required tool: ${tool}"
+  fi
+}
+
+lower() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+is_http() {
+  case "$(lower "$1")" in
+    http://*|https://*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+has_uri_scheme() {
+  case "$(lower "$1")" in
+    *://*|magnet:*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+url_host() {
+  local url="$1"
+  local rest host
+
+  rest="${url#*://}"
+  if [ "$rest" = "$url" ]; then
+    printf ''
+    return 0
+  fi
+
+  host="${rest%%/*}"
+  host="${host%%\?*}"
+  host="${host%%#*}"
+  host="${host%%:*}"
+  lower "$host"
+}
+
+url_path() {
+  local url="$1"
+  local rest path
+
+  rest="${url#*://}"
+  if [ "$rest" = "$url" ]; then
+    rest="$url"
+  fi
+
+  case "$rest" in
+    */*) path="/${rest#*/}" ;;
+    *) path="/" ;;
+  esac
+
+  path="${path%%#*}"
+  path="${path%%\?*}"
+  printf '%s' "$path"
+}
+
+query_param() {
+  local url="$1"
+  local key="$2"
+  local qs pair name value
+
+  case "$url" in
+    *\?*) qs="${url#*\?}" ;;
+    *) return 1 ;;
+  esac
+  qs="${qs%%#*}"
+
+  while [ -n "$qs" ]; do
+    case "$qs" in
+      *'&'*)
+        pair="${qs%%&*}"
+        qs="${qs#*&}"
+        ;;
+      *)
+        pair="$qs"
+        qs=""
+        ;;
+    esac
+
+    name="${pair%%=*}"
+    value="${pair#*=}"
+    if [ "$name" = "$key" ]; then
+      printf '%s' "$value"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+host_matches() {
+  local host domain
+  host="$(url_host "$1")"
+  domain="$2"
+
+  case "$host" in
+    "$domain"|*."$domain") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_pixeldrain() {
+  host_matches "$1" "pixeldrain.com"
+}
+
+is_gofile() {
+  host_matches "$1" "gofile.io"
+}
+
+is_swisstransfer() {
+  host_matches "$1" "swisstransfer.com"
+}
+
+is_gdrive() {
+  host_matches "$1" "drive.google.com" || host_matches "$1" "drive.usercontent.google.com"
+}
+
+is_password_provider() {
+  is_gofile "$1" || is_swisstransfer "$1"
+}
+
+is_torrent_like() {
+  local item="$1"
+  local clean
+
+  case "$(lower "$item")" in
+    magnet:*) return 0 ;;
+  esac
+
+  clean="${item%%#*}"
+  clean="${clean%%\?*}"
+  case "$(lower "$clean")" in
+    *.torrent) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+looks_like_source() {
+  local item="$1"
+
+  if has_uri_scheme "$item" || is_torrent_like "$item"; then
+    return 0
+  fi
+  [ -e "$item" ]
+}
+
+sanitize_provider_name() {
+  local name="$1"
+  name="$(printf '%s' "$name" | sed 's#[/]#_#g; s#[[:cntrl:]]#_#g')"
+  if [ -z "$name" ]; then
+    name="file.bin"
+  fi
+  printf '%s' "$name"
+}
+
+url_decode_if_possible() {
+  local value="$1"
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import sys, urllib.parse; print(urllib.parse.unquote(sys.argv[1]))' "$value" 2>/dev/null || printf '%s' "$value"
+  else
+    printf '%s' "$value"
+  fi
+}
+
+curl_json() {
+  curl -fsSL --connect-timeout "${FASTGET_CONNECT_TIMEOUT:-20}" --max-time "${FASTGET_API_TIMEOUT:-60}" "$@"
+}
+
+json_value() {
+  local json="$1"
+  local filter="$2"
+  printf '%s' "$json" | jq -r "$filter"
+}
+
+sha256_hex() {
+  printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
+}
+
+append_download() {
+  local i="${#DL_URLS[@]}"
+  DL_URLS[$i]="$1"
+  DL_NAMES[$i]="$2"
+  DL_COOKIES[$i]="$3"
+  DL_ORIGINS[$i]="$4"
+  DL_PROVIDERS[$i]="$5"
+}
+
+resolve_pixeldrain() {
+  local url="$1"
+  local path file_id direct_url
+
+  path="$(url_path "$url")"
+  case "$path" in
+    /api/file/*)
+      append_download "$url" "" "" "$url" "pixeldrain"
+      note "Pixeldrain: URL is already a direct API file link"
+      return 0
+      ;;
+    /u/*)
+      file_id="${path#/u/}"
+      file_id="${file_id%%/*}"
+      ;;
+    *)
+      die "Could not extract Pixeldrain file ID from: ${url}"
+      ;;
+  esac
+
+  [ -n "$file_id" ] || die "Could not extract Pixeldrain file ID from: ${url}"
+  direct_url="https://pixeldrain.com/api/file/${file_id}"
+  append_download "$direct_url" "" "" "$url" "pixeldrain"
+  note "Pixeldrain: converted file ${file_id} to direct download URL"
+}
+
+gdrive_filename_hint() {
+  local direct_url="$1"
+  local headers cd name
+
+  headers="$(curl -fsSLI -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" "$direct_url" 2>/dev/null || true)"
+  [ -n "$headers" ] || return 1
+
+  cd="$(printf '%s\n' "$headers" | tr -d '\r' | grep -i '^content-disposition:' | tail -n 1 || true)"
+  [ -n "$cd" ] || return 1
+
+  name="$(printf '%s' "$cd" | sed -n "s/.*filename\\*=UTF-8''\\([^;]*\\).*/\\1/p" | tail -n 1)"
+  if [ -z "$name" ]; then
+    name="$(printf '%s' "$cd" | sed -n 's/.*filename="\([^"]*\)".*/\1/p' | tail -n 1)"
+  fi
+  if [ -z "$name" ]; then
+    name="$(printf '%s' "$cd" | sed -n 's/.*filename=\([^;]*\).*/\1/p' | tail -n 1)"
+  fi
+
+  name="${name%\"}"
+  name="${name#\"}"
+  [ -n "$name" ] || return 1
+  url_decode_if_possible "$name"
+}
+
+resolve_gdrive() {
+  local url="$1"
+  local path file_id direct_url filename
+
+  need_tool curl "macOS normally includes curl."
+
+  path="$(url_path "$url")"
+  case "$path" in
+    */file/d/*)
+      file_id="${path#*/file/d/}"
+      file_id="${file_id%%/*}"
+      ;;
+    *)
+      file_id="$(query_param "$url" "id" || true)"
+      ;;
+  esac
+
+  [ -n "$file_id" ] || die "Could not extract Google Drive file ID from: ${url}"
+
+  direct_url="https://drive.usercontent.google.com/download?id=${file_id}&export=download&confirm=t"
+  filename="$(gdrive_filename_hint "$direct_url" || true)"
+  if [ -n "$filename" ]; then
+    filename="$(sanitize_provider_name "$filename")"
+  fi
+
+  append_download "$direct_url" "$filename" "" "$url" "gdrive"
+  if [ -z "$filename" ]; then
+    note "Google Drive: resolved file ID ${file_id}"
+  else
+    note "Google Drive: resolved file ID ${file_id} -> ${filename}"
+  fi
+}
+
+resolve_gofile() {
+  local url="$1"
+  local path content_id account_json account_status account_token
+  local content_url password_hash content_json content_status before added
+  local static_token link name
+
+  need_tool curl "macOS normally includes curl."
+  need_tool jq "Install it with: brew install jq"
+  need_tool shasum "macOS normally includes shasum."
+
+  path="$(url_path "$url")"
+  path="${path#/}"
+  case "$path" in
+    d/*)
+      content_id="${path#d/}"
+      content_id="${content_id%%/*}"
+      ;;
+    *)
+      content_id="${path%%/*}"
+      ;;
+  esac
+
+  [ -n "$content_id" ] || die "Invalid Gofile URL. Expected gofile.io/d/<contentId>"
+
+  note "Gofile: creating guest account"
+  if ! account_json="$(curl_json -X POST "https://api.gofile.io/accounts")"; then
+    die "Gofile account creation failed"
+  fi
+
+  account_status="$(json_value "$account_json" '.status // empty')"
+  [ "$account_status" = "ok" ] || die "Gofile account error: ${account_status:-unknown}"
+
+  account_token="$(json_value "$account_json" '.data.token // empty')"
+  [ -n "$account_token" ] && [ "$account_token" != "null" ] || die "Failed to get Gofile account token"
+
+  static_token="${FASTGET_GOFILE_WEBSITE_TOKEN:-4fd6sg89d7s6}"
+  content_url="https://api.gofile.io/contents/${content_id}"
+  if [ -n "$PASSWORD" ]; then
+    password_hash="$(sha256_hex "$PASSWORD")"
+    content_url="${content_url}?password=${password_hash}"
+  fi
+
+  note "Gofile: resolving content ${content_id}"
+  if ! content_json="$(curl_json \
+      -H "Authorization: Bearer ${account_token}" \
+      -H "X-Website-Token: ${static_token}" \
+      "$content_url")"; then
+    die "Gofile content request failed"
+  fi
+
+  content_status="$(json_value "$content_json" '.status // empty')"
+  case "$content_status" in
+    ok) ;;
+    error-passwordRequired) die "Gofile link requires a password. Use -p password." ;;
+    error-notFound) die "Gofile content not found. Check the URL or it may have expired." ;;
+    *) die "Gofile content error: ${content_status:-unknown}" ;;
+  esac
+
+  before="${#DL_URLS[@]}"
+  while IFS="$(printf '\t')" read -r link name; do
+    [ -n "$link" ] || continue
+    name="$(sanitize_provider_name "$name")"
+    append_download "$link" "$name" "accountToken=${account_token}" "$url" "gofile"
+  done < <(printf '%s' "$content_json" | jq -r '
+    def files:
+      if (.type // "") == "file" and ((.link // "") != "") then
+        [(.link // ""), (.name // "file.bin")] | @tsv
+      elif ((.children? // {}) | type) == "object" then
+        .children[] | files
+      else
+        empty
+      end;
+    .data | files
+  ')
+
+  added=$((${#DL_URLS[@]} - before))
+  [ "$added" -gt 0 ] || die "No downloadable files found in Gofile link"
+  note "Gofile: ${added} file(s) resolved"
+}
+
+resolve_swisstransfer() {
+  local url="$1"
+  local path folder_id api_base data expired credits container_uuid download_host
+  local need_password rows before added encoded_password file_uuid filename token payload token_json file_url
+
+  need_tool curl "macOS normally includes curl."
+  need_tool jq "Install it with: brew install jq"
+  need_tool base64 "macOS normally includes base64."
+
+  path="$(url_path "$url")"
+  path="${path%/}"
+  folder_id="${path##*/}"
+  [ -n "$folder_id" ] && [ "$folder_id" != "/" ] || die "Could not extract SwissTransfer folder ID from: ${url}"
+
+  api_base="https://www.swisstransfer.com/api"
+  note "SwissTransfer: resolving link ${folder_id}"
+
+  if ! data="$(curl_json -H "Content-Type: application/json" "${api_base}/links/${folder_id}")"; then
+    die "SwissTransfer API request failed"
+  fi
+
+  expired="$(json_value "$data" '.isExpired // false')"
+  [ "$expired" != "true" ] || die "SwissTransfer link has expired"
+
+  credits="$(json_value "$data" '.downloadCounterCredit // 1')"
+  if [ "$credits" != "null" ] && [ "$credits" -le 0 ] 2>/dev/null; then
+    die "SwissTransfer download limit reached"
+  fi
+
+  container_uuid="$(json_value "$data" '.UUID // empty')"
+  download_host="$(json_value "$data" '.downloadHost // empty')"
+  need_password="$(json_value "$data" '.needPassword // false')"
+
+  [ -n "$container_uuid" ] && [ "$container_uuid" != "null" ] || die "SwissTransfer response is missing container UUID"
+  [ -n "$download_host" ] && [ "$download_host" != "null" ] || die "SwissTransfer response is missing download host"
+  download_host="${download_host%/}"
+
+  if [ "$need_password" = "true" ] && [ -z "$PASSWORD" ]; then
+    die "SwissTransfer link requires a password. Use -p password."
+  fi
+
+  rows="$(printf '%s' "$data" | jq -r '.container.files[]? | [(.UUID // ""), (.fileName // "file.bin")] | @tsv')"
+  [ -n "$rows" ] || die "No files found in SwissTransfer link"
+
+  encoded_password=""
+  if [ "$need_password" = "true" ]; then
+    encoded_password="$(printf '%s' "$PASSWORD" | base64 | tr -d '\n')"
+  fi
+
+  before="${#DL_URLS[@]}"
+  while IFS="$(printf '\t')" read -r file_uuid filename; do
+    [ -n "$file_uuid" ] || continue
+    token=""
+    if [ "$need_password" = "true" ]; then
+      payload="$(jq -n \
+        --arg containerUUID "$container_uuid" \
+        --arg fileUUID "$file_uuid" \
+        --arg password "$encoded_password" \
+        '{containerUUID: $containerUUID, fileUUID: $fileUUID, password: $password}')"
+      if ! token_json="$(curl_json \
+          -X POST \
+          -H "Content-Type: application/json" \
+          --data "$payload" \
+          "${api_base}/generateDownloadToken")"; then
+        die "SwissTransfer token generation failed"
+      fi
+      token="$(json_value "$token_json" '.token // empty')"
+      [ -n "$token" ] && [ "$token" != "null" ] || die "Invalid SwissTransfer password or empty download token"
+    fi
+
+    filename="$(sanitize_provider_name "$filename")"
+    file_url="${download_host}/api/download/${folder_id}/${file_uuid}"
+    if [ -n "$token" ]; then
+      file_url="${file_url}?token=${token}"
+    fi
+    append_download "$file_url" "$filename" "" "$url" "swisstransfer"
+  done <<EOF_ROWS
+${rows}
+EOF_ROWS
+
+  added=$((${#DL_URLS[@]} - before))
+  [ "$added" -gt 0 ] || die "No downloadable files found in SwissTransfer link"
+  note "SwissTransfer: ${added} file(s) resolved"
+}
+
+resolve_input() {
+  local item="$1"
+
+  if is_pixeldrain "$item"; then
+    resolve_pixeldrain "$item"
+  elif is_gofile "$item"; then
+    resolve_gofile "$item"
+  elif is_swisstransfer "$item"; then
+    resolve_swisstransfer "$item"
+  elif is_gdrive "$item"; then
+    resolve_gdrive "$item"
+  else
+    if is_torrent_like "$item" && ! has_uri_scheme "$item"; then
+      case "$(lower "$item")" in
+        magnet:*) ;;
+        *) [ -f "$item" ] || die "Torrent file not found: ${item}" ;;
+      esac
+    fi
+    append_download "$item" "" "" "$item" "direct"
+  fi
+}
+
 detect_conn_cap() {
   local cap
   cap="$(aria2c -h 2>/dev/null | awk '
     /--max-connection-per-server=NUM/ {seen=1; next}
     seen && /Possible Values:/ {gsub(/[^0-9-]/,""); split($0,a,"-"); print a[2]; exit}
   ')"
-  [[ "$cap" =~ ^[0-9]+$ ]] && echo "$cap" || echo 16
+  case "$cap" in
+    ''|*[!0-9]*) echo 16 ;;
+    *) echo "$cap" ;;
+  esac
 }
+
+has_opt() {
+  case "$ARIA_HELP" in
+    *"$1"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+download_one() {
+  local url="$1"
+  local output_name="$2"
+  local cookie="$3"
+  local provider="$4"
+  local opts
+
+  opts=("${COMMON_OPTS[@]}")
+
+  if is_torrent_like "$url"; then
+    opts+=("${TORRENT_OPTS[@]}")
+    if [ -n "$OUT_NAME" ]; then
+      note "-o is ignored for torrent and magnet downloads; torrent metadata controls output paths"
+    fi
+  else
+    opts+=("${HTTP_OPTS[@]}")
+    if [ -n "$output_name" ]; then
+      opts+=( -o "$output_name" )
+    fi
+  fi
+
+  if [ -n "$cookie" ]; then
+    opts+=( --header="Cookie: ${cookie}" )
+  fi
+
+  case "$provider" in
+    direct) echo "Downloading: ${url}" >&2 ;;
+    *) echo "Downloading ${provider} file${output_name:+: ${output_name}}" >&2 ;;
+  esac
+
+  aria2c "${opts[@]}" "$url"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --sane)
+      PROFILE="sane"
+      shift
+      ;;
+    --aggressive)
+      PROFILE="aggressive"
+      shift
+      ;;
+    -o|--output)
+      [ "$#" -ge 2 ] || die "$1 requires a filename"
+      OUT_NAME="$2"
+      shift 2
+      ;;
+    --output=*)
+      OUT_NAME="${1#*=}"
+      shift
+      ;;
+    -p|--password)
+      [ "$#" -ge 2 ] || die "$1 requires a password value"
+      PASSWORD="$2"
+      shift 2
+      ;;
+    --password=*)
+      PASSWORD="${1#*=}"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      while [ "$#" -gt 0 ]; do
+        INPUTS[${#INPUTS[@]}]="$1"
+        shift
+      done
+      ;;
+    -*)
+      die "Unknown option: $1"
+      ;;
+    *)
+      INPUTS[${#INPUTS[@]}]="$1"
+      shift
+      ;;
+  esac
+done
+
+if [ "${#INPUTS[@]}" -lt 1 ]; then
+  usage
+  exit 1
+fi
+
+if [ -z "$PASSWORD" ] && [ "${#INPUTS[@]}" -eq 2 ] && is_password_provider "${INPUTS[0]}" && ! looks_like_source "${INPUTS[1]}"; then
+  PASSWORD="${INPUTS[1]}"
+  INPUTS=("${INPUTS[0]}")
+fi
+
+need_tool aria2c "Install it first with: brew install aria2"
+
+ARIA_HELP="$(aria2c -h#all 2>/dev/null || aria2c -h 2>/dev/null || true)"
 ARIA_CONN_CAP="$(detect_conn_cap)"
 
-# Profile defaults
-if [[ "$PROFILE" == "aggressive" ]]; then
+if [ "$PROFILE" = "aggressive" ]; then
   ARIA_CONN="${ARIA_CONN:-32}"
   ARIA_SPLIT="${ARIA_SPLIT:-32}"
   ARIA_CHUNK="${ARIA_CHUNK:-4M}"
@@ -57,19 +652,21 @@ else
 fi
 ARIA_TRIES="${ARIA_TRIES:-0}"
 ARIA_WAIT="${ARIA_WAIT:-5}"
+ARIA_BT_STOP_TIMEOUT="${ARIA_BT_STOP_TIMEOUT:-300}"
+ARIA_BT_MAX_PEERS="${ARIA_BT_MAX_PEERS:-100}"
+ARIA_BT_TRACKERS="${ARIA_BT_TRACKERS:-udp://tracker.opentrackr.org:1337/announce,udp://open.stealth.si:80/announce,udp://tracker.torrent.eu.org:451/announce}"
+FASTGET_USER_AGENT="${FASTGET_USER_AGENT:-Mozilla/5.0}"
 
-# Clamp connections
-if (( ARIA_CONN > ARIA_CONN_CAP )); then
-  echo "Note: clamping --max-connection-per-server from ${ARIA_CONN} to ${ARIA_CONN_CAP}" >&2
+case "$ARIA_CONN" in
+  ''|*[!0-9]*) die "ARIA_CONN must be a number" ;;
+esac
+
+if [ "$ARIA_CONN" -gt "$ARIA_CONN_CAP" ]; then
+  note "clamping --max-connection-per-server from ${ARIA_CONN} to ${ARIA_CONN_CAP}"
   ARIA_CONN="$ARIA_CONN_CAP"
 fi
 
-# Helper: check if aria2c supports an option
-has_opt() {
-  aria2c -h 2>/dev/null | grep -q -- "$1"
-}
-
-OPTS=(
+COMMON_OPTS=(
   --continue=true
   --max-connection-per-server="${ARIA_CONN}"
   --split="${ARIA_SPLIT}"
@@ -80,21 +677,60 @@ OPTS=(
   --auto-file-renaming=false
   --retry-wait="${ARIA_WAIT}"
   --max-tries="${ARIA_TRIES}"
-  --conditional-get=true
   --uri-selector=inorder
   --console-log-level=warn
   --summary-interval=3
-  --header="Accept-Encoding: identity"
   --reuse-uri=true
+  --check-certificate=true
 )
 
-# Add only if supported
-has_opt "--enable-mmap"    && OPTS+=( --enable-mmap=true )
-has_opt "--async-dns"      && OPTS+=( --async-dns=true )
+HTTP_OPTS=(
+  --conditional-get=true
+  --header="Accept-Encoding: identity"
+  --user-agent="${FASTGET_USER_AGENT}"
+)
 
-# Respect -o if one URL
-if [ -n "$OUT_NAME" ] && [ "$#" -eq 1 ]; then
-  OPTS+=( -o "$OUT_NAME" )
+TORRENT_OPTS=(
+  --seed-time=0
+  --bt-save-metadata=false
+  --enable-dht=true
+  --enable-peer-exchange=true
+  --bt-max-peers="${ARIA_BT_MAX_PEERS}"
+  --bt-tracker-connect-timeout=10
+  --bt-tracker-timeout=10
+  --bt-stop-timeout="${ARIA_BT_STOP_TIMEOUT}"
+)
+
+has_opt "--enable-mmap" && COMMON_OPTS+=( --enable-mmap=true )
+has_opt "--async-dns" && COMMON_OPTS+=( --async-dns=true )
+has_opt "--content-disposition-default-utf8" && HTTP_OPTS+=( --content-disposition-default-utf8=true )
+has_opt "--follow-torrent" && TORRENT_OPTS+=( --follow-torrent=mem )
+has_opt "--bt-tracker" && TORRENT_OPTS+=( --bt-tracker="${ARIA_BT_TRACKERS}" )
+
+DL_URLS=()
+DL_NAMES=()
+DL_COOKIES=()
+DL_ORIGINS=()
+DL_PROVIDERS=()
+
+for input in "${INPUTS[@]}"; do
+  resolve_input "$input"
+done
+
+if [ -n "$OUT_NAME" ] && [ "${#DL_URLS[@]}" -ne 1 ]; then
+  note "-o is ignored because ${#DL_URLS[@]} downloads were resolved"
 fi
 
-aria2c "${OPTS[@]}" "$@"
+idx=0
+while [ "$idx" -lt "${#DL_URLS[@]}" ]; do
+  url="${DL_URLS[$idx]}"
+  output_name=""
+  if [ -n "$OUT_NAME" ] && [ "${#DL_URLS[@]}" -eq 1 ] && ! is_torrent_like "$url"; then
+    output_name="$OUT_NAME"
+  elif [ -n "${DL_NAMES[$idx]}" ] && ! is_torrent_like "$url"; then
+    output_name="${DL_NAMES[$idx]}"
+  fi
+
+  download_one "$url" "$output_name" "${DL_COOKIES[$idx]}" "${DL_PROVIDERS[$idx]}"
+  idx=$((idx + 1))
+done
