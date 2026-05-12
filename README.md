@@ -14,6 +14,7 @@ Current supported input types:
 - Google Drive file links.
 - Seyarabata file links.
 - Transfer.it transfer links.
+- Yandex Disk public links.
 - Magnet links.
 - Local `.torrent` files.
 - Remote HTTP(S) `.torrent` URLs.
@@ -40,6 +41,7 @@ Run downloads from this repo:
 ./fastget -p 'secret' 'https://www.swisstransfer.com/d/TRANSFER_ID'
 ./fastget 'https://seyarabata.com/FILE_ID'
 ./fastget 'https://transfer.it/t/TRANSFER_ID'
+./fastget 'https://disk.yandex.com.tr/d/PUBLIC_ID'
 ./fastget --interface en9 'https://example.com/huge-file.bin'
 ./fastget --parallel 6 'https://example.com/a.bin' 'https://example.com/b.bin'
 ./fastget 'magnet:?xt=urn:btih:...'
@@ -88,8 +90,8 @@ At a high level, `fastget` turns each user input into one or more concrete
 download jobs, then runs `aria2c` for each job.
 
 For direct URLs, magnets, and torrents, the input is already usable by `aria2c`.
-For provider links such as Gofile, SwissTransfer, Seyarabata, or Transfer.it,
-the script
+For provider links such as Gofile, SwissTransfer, Seyarabata, Transfer.it, or
+Yandex Disk, the script
 first resolves the provider page/API, extracts direct file URLs or provider
 download endpoints, chooses output filenames when available, attaches any
 required cookies or tokens, then hands the final URLs to `aria2c`.
@@ -404,6 +406,67 @@ Limitations:
   multi-file link lacks that archive node, `fastget` stops rather than silently
   downloading only one item.
 
+### Yandex Disk
+
+Recognized hosts:
+
+- `disk.yandex.*`, including `disk.yandex.com.tr`
+- `yadi.sk`
+- `www.yadi.sk`
+
+Supported formats:
+
+```text
+https://disk.yandex.com.tr/d/PUBLIC_ID
+https://disk.yandex.ru/d/PUBLIC_ID
+https://yadi.sk/d/PUBLIC_ID
+```
+
+Resolver behavior:
+
+1. Uses the entire public URL as the Yandex `public_key`. This matters because
+   Yandex accepts localized domains such as `disk.yandex.com.tr`, while the API
+   may return a normalized `yadi.sk` public URL.
+2. Calls the public resource metadata API:
+
+```text
+GET https://cloud-api.yandex.net/v1/disk/public/resources?public_key=PUBLIC_URL&limit=1
+```
+
+3. Reads:
+
+- `type`
+- `name`
+- `size` when provided by the API
+- checksum fields such as `md5` and `sha256` when provided by the API
+
+4. Uses `name` as the aria2 output filename. If the resource is a directory,
+   appends `.zip` because the public download endpoint returns an archive-style
+   download for folder resources.
+5. Calls the public download API:
+
+```text
+GET https://cloud-api.yandex.net/v1/disk/public/resources/download?public_key=PUBLIC_URL
+```
+
+6. Reads the signed `href` returned by the API.
+7. Passes that signed Yandex downloader URL to `aria2c`.
+
+Important detail: opening the browser page can redirect to a Yandex captcha.
+`fastget` avoids the page entirely and uses the public Disk API, which returned
+a signed `downloader.disk.yandex.ru` URL for the tested Turkish-domain link.
+That URL redirected to Yandex storage with `Accept-Ranges: bytes`, so aria2 can
+use segmented downloads.
+
+Limitations:
+
+- Yandex signed downloader URLs are generated during resolver time. Do not store
+  them for later use.
+- Private Yandex Disk resources, removed public links, quota errors, or API-side
+  abuse checks can still block resolution.
+- Folder support depends on Yandex continuing to return a downloadable archive
+  from the public download endpoint.
+
 ### Magnet Links
 
 Recognized format:
@@ -569,6 +632,11 @@ Transfer.it:
   `https://bt7.api.mega.co.nz`. This is only here in case Transfer.it moves the
   API host used by the web client.
 
+Yandex Disk:
+
+- `FASTGET_YANDEXDISK_API`: overrides the Yandex Disk public resources API base.
+  Default is `https://cloud-api.yandex.net/v1/disk/public/resources`.
+
 BitTorrent:
 
 - `ARIA_BT_TRACKERS`: comma-separated additional trackers.
@@ -594,7 +662,7 @@ Required for all downloads:
 Required for provider resolvers:
 
 - `curl`: used for API calls and Google Drive filename detection.
-- `jq`: used to parse Gofile, SwissTransfer, and Transfer.it JSON.
+- `jq`: used to parse Gofile, SwissTransfer, Transfer.it, and Yandex Disk JSON.
 - `shasum`: used to SHA-256 hash Gofile passwords.
 - `base64`: used to encode SwissTransfer passwords.
 
@@ -625,7 +693,7 @@ Key functions:
 - `url_host`, `url_path`, `query_param`: small URL helpers implemented in Bash.
 - `host_matches`: safe domain matching for provider detection.
 - `is_pixeldrain`, `is_gofile`, `is_swisstransfer`, `is_gdrive`,
-  `is_seyarabata`, `is_transferit`: provider detectors.
+  `is_seyarabata`, `is_transferit`, `is_yandexdisk`: provider detectors.
 - `is_torrent_like`: detects magnet links and `.torrent` paths/URLs.
 - `looks_like_source`: helps decide whether a second positional argument is a
   password or another source.
@@ -641,6 +709,8 @@ Key functions:
 - `resolve_transferit`: calls Transfer.it's metadata, file-list, password
   validation, and signed download URL APIs, then passes the signed CDN URL to
   aria2.
+- `resolve_yandexdisk`: calls the Yandex Disk public metadata and download APIs,
+  then passes the signed downloader URL to aria2.
 - `resolve_input`: dispatches one user argument to the right resolver.
 - `detect_conn_cap`: reads the local `aria2c` help output and detects the max
   connection cap.
@@ -764,6 +834,8 @@ part of normal use.
   `/d/FILE_ID` redirect behavior.
 - Transfer.it support depends on the current `xi`, `f`, `xv`, and `g` API
   actions exposed by the Transfer.it web client.
+- Yandex Disk support depends on the public resources API and its signed
+  download `href` response.
 - Password support is implemented for Gofile, SwissTransfer, and Transfer.it.
 - The script downloads files only. It does not upload to Telegram, split files,
   or mirror media. That behavior belongs to the separate Telegram bot project.
@@ -796,6 +868,7 @@ Provider support added directly to `fastget` after the bot port:
 
 - `resolve_seyarabata`
 - `resolve_transferit`
+- `resolve_yandexdisk`
 
 ## License
 
