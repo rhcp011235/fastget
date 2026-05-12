@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# fastget — universal aria2c wrapper with auto feature detection
+# Usage:
+#   fastget <url> [more_urls...]
+#   fastget -o file.zip <url>
+#   fastget --sane <url>    # less aggressive profile
+
+set -euo pipefail
+
+PROFILE="aggressive"
+OUT_NAME=""
+if [[ "${1:-}" == "--sane" ]]; then
+  PROFILE="sane"
+  shift
+fi
+
+while getopts ":o:" opt; do
+  case "$opt" in
+    o) OUT_NAME="$OPTARG" ;;
+    *) echo "Usage: $0 [--sane] [-o output] <url> [more_urls...]"; exit 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+if ! command -v aria2c >/dev/null 2>&1; then
+  echo "Error: aria2c not found. Install it first (brew install aria2 on macOS)." >&2
+  exit 127
+fi
+
+if [ "$#" -lt 1 ]; then
+  echo "Usage: $0 [--sane] [-o output] <url> [more_urls...]"
+  exit 1
+fi
+
+# Detect max cap for --max-connection-per-server (usually 16)
+detect_conn_cap() {
+  local cap
+  cap="$(aria2c -h 2>/dev/null | awk '
+    /--max-connection-per-server=NUM/ {seen=1; next}
+    seen && /Possible Values:/ {gsub(/[^0-9-]/,""); split($0,a,"-"); print a[2]; exit}
+  ')"
+  [[ "$cap" =~ ^[0-9]+$ ]] && echo "$cap" || echo 16
+}
+ARIA_CONN_CAP="$(detect_conn_cap)"
+
+# Profile defaults
+if [[ "$PROFILE" == "aggressive" ]]; then
+  ARIA_CONN="${ARIA_CONN:-32}"
+  ARIA_SPLIT="${ARIA_SPLIT:-32}"
+  ARIA_CHUNK="${ARIA_CHUNK:-4M}"
+  ARIA_CACHE="${ARIA_CACHE:-512M}"
+else
+  ARIA_CONN="${ARIA_CONN:-16}"
+  ARIA_SPLIT="${ARIA_SPLIT:-16}"
+  ARIA_CHUNK="${ARIA_CHUNK:-2M}"
+  ARIA_CACHE="${ARIA_CACHE:-256M}"
+fi
+ARIA_TRIES="${ARIA_TRIES:-0}"
+ARIA_WAIT="${ARIA_WAIT:-5}"
+
+# Clamp connections
+if (( ARIA_CONN > ARIA_CONN_CAP )); then
+  echo "Note: clamping --max-connection-per-server from ${ARIA_CONN} to ${ARIA_CONN_CAP}" >&2
+  ARIA_CONN="$ARIA_CONN_CAP"
+fi
+
+# Helper: check if aria2c supports an option
+has_opt() {
+  aria2c -h 2>/dev/null | grep -q -- "$1"
+}
+
+OPTS=(
+  --continue=true
+  --max-connection-per-server="${ARIA_CONN}"
+  --split="${ARIA_SPLIT}"
+  --min-split-size="${ARIA_CHUNK}"
+  --piece-length="${ARIA_CHUNK}"
+  --disk-cache="${ARIA_CACHE}"
+  --file-allocation=none
+  --auto-file-renaming=false
+  --retry-wait="${ARIA_WAIT}"
+  --max-tries="${ARIA_TRIES}"
+  --conditional-get=true
+  --uri-selector=inorder
+  --console-log-level=warn
+  --summary-interval=3
+  --header="Accept-Encoding: identity"
+  --reuse-uri=true
+)
+
+# Add only if supported
+has_opt "--enable-mmap"    && OPTS+=( --enable-mmap=true )
+has_opt "--async-dns"      && OPTS+=( --async-dns=true )
+
+# Respect -o if one URL
+if [ -n "$OUT_NAME" ] && [ "$#" -eq 1 ]; then
+  OPTS+=( -o "$OUT_NAME" )
+fi
+
+aria2c "${OPTS[@]}" "$@"
