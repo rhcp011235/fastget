@@ -12,6 +12,7 @@ Current supported input types:
 - Gofile folder/file links.
 - SwissTransfer transfer links.
 - Google Drive file links.
+- Seyarabata file links.
 - Magnet links.
 - Local `.torrent` files.
 - Remote HTTP(S) `.torrent` URLs.
@@ -36,6 +37,7 @@ Run downloads from this repo:
 ./fastget 'https://drive.google.com/file/d/FILE_ID/view'
 ./fastget -p 'secret' 'https://gofile.io/d/CONTENT_ID'
 ./fastget -p 'secret' 'https://www.swisstransfer.com/d/TRANSFER_ID'
+./fastget 'https://seyarabata.com/FILE_ID'
 ./fastget --interface en9 'https://example.com/huge-file.bin'
 ./fastget --parallel 6 'https://example.com/a.bin' 'https://example.com/b.bin'
 ./fastget 'magnet:?xt=urn:btih:...'
@@ -83,10 +85,10 @@ At a high level, `fastget` turns each user input into one or more concrete
 download jobs, then runs `aria2c` for each job.
 
 For direct URLs, magnets, and torrents, the input is already usable by `aria2c`.
-For provider links such as Gofile or SwissTransfer, the script first calls that
-provider's API, extracts direct file URLs, chooses output filenames when
-available, attaches any required cookies or tokens, then hands the final URLs to
-`aria2c`.
+For provider links such as Gofile, SwissTransfer, or Seyarabata, the script
+first resolves the provider page/API, extracts direct file URLs or provider
+download endpoints, chooses output filenames when available, attaches any
+required cookies or tokens, then hands the final URLs to `aria2c`.
 
 The script keeps HTTP downloads and BitTorrent downloads separate because they
 need different `aria2c` options. HTTP downloads benefit from output names,
@@ -285,6 +287,50 @@ GET https://www.swisstransfer.com/api/links/TRANSFER_ID
 7. Downloads each resolved file URL with `aria2c`.
 
 Password-protected SwissTransfer links require `-p` or `FASTGET_PASSWORD`.
+
+### Seyarabata
+
+Recognized hosts:
+
+- `seyarabata.com`
+- `www.seyarabata.com`
+
+Supported formats:
+
+```text
+https://seyarabata.com/FILE_ID
+https://seyarabata.com/t/FILE_ID
+https://seyarabata.com/d/FILE_ID
+```
+
+Resolver behavior:
+
+1. Extracts the file ID from the root path, `/t/FILE_ID`, or `/d/FILE_ID`.
+2. Fetches the preview page:
+
+```text
+GET https://seyarabata.com/t/FILE_ID
+```
+
+3. Reads the visible filename from the preview title.
+4. Reads the download button href when present.
+5. Falls back to:
+
+```text
+https://seyarabata.com/d/FILE_ID
+```
+
+6. Sends that provider download endpoint to `aria2c`, with the preview filename
+   as `-o` when it was found.
+
+Important detail: `https://seyarabata.com/d/FILE_ID` returns a fresh signed
+redirect to `dl.seyarabata.com`. The final signed URL accepted a range GET
+during testing, but returned 404 to HEAD. Because of that, `fastget` deliberately
+passes the `/d/FILE_ID` endpoint to aria2 instead of freezing the signed URL
+found during resolution.
+
+Already-signed `dl.seyarabata.com/...` URLs are treated as ordinary direct URLs
+instead of Seyarabata provider links.
 
 ### Magnet Links
 
@@ -497,8 +543,8 @@ Key functions:
   parallel downloads when the shell starts with a small limit.
 - `url_host`, `url_path`, `query_param`: small URL helpers implemented in Bash.
 - `host_matches`: safe domain matching for provider detection.
-- `is_pixeldrain`, `is_gofile`, `is_swisstransfer`, `is_gdrive`: provider
-  detectors.
+- `is_pixeldrain`, `is_gofile`, `is_swisstransfer`, `is_gdrive`,
+  `is_seyarabata`: provider detectors.
 - `is_torrent_like`: detects magnet links and `.torrent` paths/URLs.
 - `looks_like_source`: helps decide whether a second positional argument is a
   password or another source.
@@ -509,6 +555,8 @@ Key functions:
   files recursively, and stores the required cookie.
 - `resolve_swisstransfer`: fetches transfer metadata, generates password tokens
   when needed, and builds per-file API download URLs.
+- `resolve_seyarabata`: fetches the preview page, extracts the filename and
+  `/d/FILE_ID` endpoint, and lets aria2 receive the fresh signed redirect.
 - `resolve_input`: dispatches one user argument to the right resolver.
 - `detect_conn_cap`: reads the local `aria2c` help output and detects the max
   connection cap.
@@ -616,12 +664,19 @@ rm -f /tmp/README.md /tmp/README.md.aria2 /tmp/LICENSE /tmp/LICENSE.aria2
 Provider tests require real links. Prefer small test files because `fastget`
 will download the full resolved file.
 
+For a large provider link where you need to test only the resolver path, export
+a fake `aria2c` function in a throwaway shell so the script prints the final
+arguments without downloading. Keep this as a manual diagnostic rather than
+part of normal use.
+
 ## Known Limitations
 
 - Provider APIs can change. If Gofile or SwissTransfer changes response shape or
   token requirements, update the resolver and this README together.
 - Google Drive can still block files that require login, exceed quota, or show
   non-download interstitial pages.
+- Seyarabata support depends on the current `/t/FILE_ID` preview page and
+  `/d/FILE_ID` redirect behavior.
 - Password support is implemented only for Gofile and SwissTransfer.
 - The script downloads files only. It does not upload to Telegram, split files,
   or mirror media. That behavior belongs to the separate Telegram bot project.
@@ -649,6 +704,10 @@ Provider parity brought into `fastget`:
 - `resolve_swisstransfer`
 - `resolve_gdrive`
 - magnet and `.torrent` handling through `aria2c`
+
+Provider support added directly to `fastget` after the bot port:
+
+- `resolve_seyarabata`
 
 ## License
 

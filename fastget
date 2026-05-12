@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # fastget - universal aria2c wrapper with host resolvers.
 # Supports direct URLs, Pixeldrain, Gofile, SwissTransfer, Google Drive,
-# magnet links, and local/remote .torrent files.
+# Seyarabata, magnet links, and local/remote .torrent files.
 
 set -euo pipefail
 
@@ -28,7 +28,7 @@ Examples:
   ${PROGRAM} ./file.torrent
 
 Supported:
-  direct HTTP(S), Pixeldrain, Gofile, SwissTransfer, Google Drive file links,
+  direct HTTP(S), Pixeldrain, Gofile, SwissTransfer, Google Drive, Seyarabata,
   magnet links, local .torrent files, and remote .torrent URLs.
 
 Options:
@@ -218,6 +218,15 @@ is_gdrive() {
   host_matches "$1" "drive.google.com" || host_matches "$1" "drive.usercontent.google.com"
 }
 
+is_seyarabata() {
+  local host
+  host="$(url_host "$1")"
+  case "$host" in
+    seyarabata.com|www.seyarabata.com) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 is_password_provider() {
   is_gofile "$1" || is_swisstransfer "$1"
 }
@@ -261,6 +270,16 @@ url_decode_if_possible() {
 
   if command -v python3 >/dev/null 2>&1; then
     python3 -c 'import sys, urllib.parse; print(urllib.parse.unquote(sys.argv[1]))' "$value" 2>/dev/null || printf '%s' "$value"
+  else
+    printf '%s' "$value"
+  fi
+}
+
+html_decode_if_possible() {
+  local value="$1"
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import html, sys; print(html.unescape(sys.argv[1]))' "$value" 2>/dev/null || printf '%s' "$value"
   else
     printf '%s' "$value"
   fi
@@ -369,6 +388,86 @@ resolve_gdrive() {
     note "Google Drive: resolved file ID ${file_id}"
   else
     note "Google Drive: resolved file ID ${file_id} -> ${filename}"
+  fi
+}
+
+seyarabata_filename_from_html() {
+  awk '
+    BEGIN { RS = "</p>"; ORS = "" }
+    /s-preview__title/ {
+      gsub(/\n/, " ")
+      sub(/.*s-preview__title[^>]*>/, "")
+      gsub(/<[^>]*>/, "")
+      gsub(/^[[:space:]]+/, "")
+      gsub(/[[:space:]]+$/, "")
+      print
+      exit
+    }
+  '
+}
+
+resolve_seyarabata() {
+  local url="$1"
+  local path file_id preview_url html href download_url filename headers location loc_path
+
+  need_tool curl "macOS normally includes curl."
+
+  path="$(url_path "$url")"
+  path="${path#/}"
+  case "$path" in
+    t/*|d/*)
+      file_id="${path#*/}"
+      file_id="${file_id%%/*}"
+      ;;
+    *)
+      file_id="${path%%/*}"
+      ;;
+  esac
+
+  [ -n "$file_id" ] || die "Could not extract Seyarabata file ID from: ${url}"
+
+  preview_url="https://seyarabata.com/t/${file_id}"
+  note "Seyarabata: resolving file ${file_id}"
+
+  if ! html="$(curl -fsSL -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" "$preview_url")"; then
+    die "Seyarabata preview request failed"
+  fi
+
+  filename="$(printf '%s' "$html" | seyarabata_filename_from_html || true)"
+  if [ -n "$filename" ]; then
+    filename="$(html_decode_if_possible "$filename")"
+    filename="$(sanitize_provider_name "$filename")"
+  fi
+
+  href="$(printf '%s' "$html" | sed -n 's/.*href="\([^"]*\/d\/[^"]*\)".*/\1/p' | head -n 1)"
+  if [ -z "$href" ]; then
+    href="/d/${file_id}"
+  fi
+
+  case "$href" in
+    http://*|https://*) download_url="$href" ;;
+    /*) download_url="https://seyarabata.com${href}" ;;
+    *) download_url="https://seyarabata.com/${href}" ;;
+  esac
+
+  if [ -z "$filename" ]; then
+    headers="$(curl -fsSI -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" "$download_url" 2>/dev/null || true)"
+    location="$(printf '%s\n' "$headers" | tr -d '\r' | awk 'tolower($1) == "location:" {print $2; exit}')"
+    if [ -n "$location" ]; then
+      loc_path="$(url_path "$location")"
+      filename="${loc_path##*/}"
+      filename="$(url_decode_if_possible "$filename")"
+      if [ -n "$filename" ]; then
+        filename="$(sanitize_provider_name "$filename")"
+      fi
+    fi
+  fi
+
+  append_download "$download_url" "$filename" "" "$url" "seyarabata"
+  if [ -n "$filename" ]; then
+    note "Seyarabata: resolved ${filename}"
+  else
+    note "Seyarabata: resolved download endpoint"
   fi
 }
 
@@ -548,6 +647,8 @@ resolve_input() {
     resolve_swisstransfer "$item"
   elif is_gdrive "$item"; then
     resolve_gdrive "$item"
+  elif is_seyarabata "$item"; then
+    resolve_seyarabata "$item"
   else
     if is_torrent_like "$item" && ! has_uri_scheme "$item"; then
       case "$(lower "$item")" in
