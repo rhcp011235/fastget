@@ -26,6 +26,7 @@ Examples:
   ${PROGRAM} https://transfer.it/t/<id>
   ${PROGRAM} https://disk.yandex.com.tr/d/<id>
   ${PROGRAM} https://www.mediafire.com/file/<id>/<name>/file
+  ${PROGRAM} https://www.mediafire.com/folder/<id>/<name>
   ${PROGRAM} --interface en9 https://example.com/huge.bin
   ${PROGRAM} --parallel 6 https://example.com/a.bin https://example.com/b.bin
   ${PROGRAM} "magnet:?xt=urn:btih:..."
@@ -61,6 +62,7 @@ Environment:
   ARIA_BT_STOP_TIMEOUT   Stop torrent if speed is 0 for this many seconds.
   FASTGET_TRANSFERIT_API Transfer.it API base, default https://bt7.api.mega.co.nz.
   FASTGET_YANDEXDISK_API Yandex public resources API base.
+  FASTGET_MEDIAFIRE_API  MediaFire API base, default https://www.mediafire.com/api/1.5.
 EOF
 }
 
@@ -367,6 +369,30 @@ mediafire_filename_from_html() {
       exit
     }
   '
+}
+
+mediafire_check_api_response() {
+  local json="$1"
+  local context="$2"
+  local result message
+
+  result="$(json_value "$json" '.response.result // empty')"
+  if [ "$result" != "Success" ]; then
+    message="$(json_value "$json" '.response.message // .response.error // .response.error_message // "unknown error"')"
+    die "MediaFire ${context} API error: ${message}"
+  fi
+}
+
+mediafire_folder_content_json() {
+  local folder_key="$1"
+  local content_type="$2"
+  local chunk="$3"
+  local api_base encoded_key
+
+  api_base="${FASTGET_MEDIAFIRE_API:-https://www.mediafire.com/api/1.5}"
+  api_base="${api_base%/}"
+  encoded_key="$(jq -nr --arg value "$folder_key" '$value | @uri')"
+  curl_json "${api_base}/folder/get_content.php?folder_key=${encoded_key}&content_type=${content_type}&chunk=${chunk}&response_format=json"
 }
 
 curl_json() {
@@ -818,25 +844,14 @@ resolve_yandexdisk() {
   fi
 }
 
-resolve_mediafire() {
+resolve_mediafire_file_page() {
   local url="$1"
-  local path file_id html direct_url filename direct_path
+  local file_id="$2"
+  local output_name="${3-}"
+  local origin="${4-$url}"
+  local html direct_url filename direct_path
 
   need_tool curl "macOS normally includes curl."
-
-  path="$(url_path "$url")"
-  case "$path" in
-    /file/*|/download/*)
-      file_id="${path#/file/}"
-      file_id="${file_id#/download/}"
-      file_id="${file_id%%/*}"
-      ;;
-    *)
-      die "Invalid MediaFire URL. Expected mediafire.com/file/<id>/<name>/file"
-      ;;
-  esac
-
-  [ -n "$file_id" ] || die "Could not extract MediaFire file ID from: ${url}"
 
   note "MediaFire: resolving file ${file_id}"
   if ! html="$(curl -fsSL -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" "$url")"; then
@@ -853,7 +868,11 @@ resolve_mediafire() {
     *) die "Could not find MediaFire direct download URL in page" ;;
   esac
 
-  filename="$(printf '%s' "$html" | mediafire_filename_from_html || true)"
+  filename="$output_name"
+  if [ -z "$filename" ]; then
+    filename="$(printf '%s' "$html" | mediafire_filename_from_html || true)"
+  fi
+
   if [ -n "$filename" ]; then
     filename="$(html_decode_if_possible "$filename")"
     filename="$(sanitize_provider_name "$filename")"
@@ -866,12 +885,137 @@ resolve_mediafire() {
     fi
   fi
 
-  append_download "$direct_url" "$filename" "" "$url" "mediafire"
+  append_download "$direct_url" "$filename" "" "$origin" "mediafire"
   if [ -n "$filename" ]; then
     note "MediaFire: resolved ${filename}"
   else
     note "MediaFire: resolved download endpoint"
   fi
+}
+
+mediafire_resolve_folder_files() {
+  local origin="$1"
+  local folder_key="$2"
+  local prefix="${3-}"
+  local chunk json rows more file_url filename output_name _quickkey
+
+  chunk=1
+  while :; do
+    if ! json="$(mediafire_folder_content_json "$folder_key" "files" "$chunk")"; then
+      die "MediaFire folder file-list request failed"
+    fi
+    mediafire_check_api_response "$json" "folder file-list"
+
+    rows="$(printf '%s' "$json" | jq -r '
+      .response.folder_content.files[]?
+      | [(.links.normal_download // ""), (.filename // "file.bin"), (.quickkey // "")]
+      | @tsv
+    ')"
+
+    while IFS="$(printf '\t')" read -r file_url filename _quickkey; do
+      [ -n "$file_url" ] || continue
+      filename="$(sanitize_provider_name "$filename")"
+      if [ -n "$prefix" ]; then
+        output_name="$(sanitize_provider_name "${prefix}_${filename}")"
+      else
+        output_name="$filename"
+      fi
+      resolve_mediafire_file_page "$file_url" "${_quickkey:-unknown}" "$output_name" "$origin"
+    done <<EOF_ROWS
+${rows}
+EOF_ROWS
+
+    more="$(json_value "$json" '.response.folder_content.more_chunks // "no"')"
+    [ "$more" = "yes" ] || break
+    chunk=$((chunk + 1))
+  done
+}
+
+mediafire_resolve_folder_children() {
+  local origin="$1"
+  local folder_key="$2"
+  local prefix="${3-}"
+  local chunk json rows more child_key child_name child_prefix
+
+  chunk=1
+  while :; do
+    if ! json="$(mediafire_folder_content_json "$folder_key" "folders" "$chunk")"; then
+      die "MediaFire folder subfolder-list request failed"
+    fi
+    mediafire_check_api_response "$json" "folder subfolder-list"
+
+    rows="$(printf '%s' "$json" | jq -r '
+      .response.folder_content.folders[]?
+      | [(.folderkey // .folder_key // .quickkey // ""), (.name // .foldername // .filename // "folder")]
+      | @tsv
+    ')"
+
+    while IFS="$(printf '\t')" read -r child_key child_name; do
+      [ -n "$child_key" ] || continue
+      child_name="$(sanitize_provider_name "$child_name")"
+      if [ -n "$prefix" ]; then
+        child_prefix="$(sanitize_provider_name "${prefix}_${child_name}")"
+      else
+        child_prefix="$child_name"
+      fi
+      mediafire_resolve_folder_tree "$origin" "$child_key" "$child_prefix"
+    done <<EOF_ROWS
+${rows}
+EOF_ROWS
+
+    more="$(json_value "$json" '.response.folder_content.more_chunks // "no"')"
+    [ "$more" = "yes" ] || break
+    chunk=$((chunk + 1))
+  done
+}
+
+mediafire_resolve_folder_tree() {
+  local origin="$1"
+  local folder_key="$2"
+  local prefix="${3-}"
+
+  mediafire_resolve_folder_files "$origin" "$folder_key" "$prefix"
+  mediafire_resolve_folder_children "$origin" "$folder_key" "$prefix"
+}
+
+resolve_mediafire_folder() {
+  local url="$1"
+  local folder_key="$2"
+  local before added
+
+  need_tool jq "Install it with: brew install jq"
+
+  note "MediaFire: resolving folder ${folder_key}"
+  before="${#DL_URLS[@]}"
+  mediafire_resolve_folder_tree "$url" "$folder_key" ""
+  added=$((${#DL_URLS[@]} - before))
+  [ "$added" -gt 0 ] || die "No downloadable files found in MediaFire folder"
+  note "MediaFire: ${added} file(s) resolved from folder"
+}
+
+resolve_mediafire() {
+  local url="$1"
+  local path file_id folder_key
+
+  path="$(url_path "$url")"
+  case "$path" in
+    /file/*|/download/*)
+      file_id="${path#/file/}"
+      file_id="${file_id#/download/}"
+      file_id="${file_id%%/*}"
+      [ -n "$file_id" ] || die "Could not extract MediaFire file ID from: ${url}"
+      resolve_mediafire_file_page "$url" "$file_id"
+      ;;
+    /folder/*)
+      folder_key="${path#/folder/}"
+      folder_key="${folder_key%%/*}"
+      [ -n "$folder_key" ] || die "Could not extract MediaFire folder key from: ${url}"
+      resolve_mediafire_folder "$url" "$folder_key"
+      ;;
+    *)
+      die "Invalid MediaFire URL. Expected mediafire.com/file/<id>/<name>/file or mediafire.com/folder/<key>/<name>"
+      ;;
+  esac
 }
 
 resolve_gofile() {
