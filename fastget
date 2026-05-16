@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # fastget - universal aria2c wrapper with host resolvers.
 # Supports direct URLs, Pixeldrain, Gofile, SwissTransfer, Google Drive,
-# Seyarabata, Transfer.it, Yandex Disk, magnet links, and local/remote
-# .torrent files.
+# Seyarabata, Transfer.it, Yandex Disk, MediaFire, magnet links, and
+# local/remote .torrent files.
 
 set -euo pipefail
 
@@ -25,6 +25,7 @@ Examples:
   ${PROGRAM} -p secret https://www.swisstransfer.com/d/<id>
   ${PROGRAM} https://transfer.it/t/<id>
   ${PROGRAM} https://disk.yandex.com.tr/d/<id>
+  ${PROGRAM} https://www.mediafire.com/file/<id>/<name>/file
   ${PROGRAM} --interface en9 https://example.com/huge.bin
   ${PROGRAM} --parallel 6 https://example.com/a.bin https://example.com/b.bin
   ${PROGRAM} "magnet:?xt=urn:btih:..."
@@ -32,8 +33,8 @@ Examples:
 
 Supported:
   direct HTTP(S), Pixeldrain, Gofile, SwissTransfer, Google Drive, Seyarabata,
-  Transfer.it, Yandex Disk, magnet links, local .torrent files, and remote
-  .torrent URLs.
+  Transfer.it, Yandex Disk, MediaFire, magnet links, local .torrent files, and
+  remote .torrent URLs.
 
 Options:
   --sane                 Use a less aggressive aria2 profile.
@@ -251,6 +252,15 @@ is_yandexdisk() {
   esac
 }
 
+is_mediafire() {
+  local host
+  host="$(url_host "$1")"
+  case "$host" in
+    mediafire.com|www.mediafire.com|m.mediafire.com) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 is_password_provider() {
   is_gofile "$1" || is_swisstransfer "$1" || is_transferit "$1"
 }
@@ -334,6 +344,29 @@ html_decode_if_possible() {
   else
     printf '%s' "$value"
   fi
+}
+
+mediafire_direct_from_html() {
+  awk '
+    BEGIN { RS = "<a"; ORS = "" }
+    /id="downloadButton"/ || /aria-label="Download file"/ {
+      if (match($0, /href="[^"]+"/)) {
+        print substr($0, RSTART + 6, RLENGTH - 7)
+        exit
+      }
+    }
+  '
+}
+
+mediafire_filename_from_html() {
+  awk '
+    /var optFileName = "/ {
+      sub(/.*var optFileName = "/, "")
+      sub(/".*/, "")
+      print
+      exit
+    }
+  '
 }
 
 curl_json() {
@@ -785,6 +818,62 @@ resolve_yandexdisk() {
   fi
 }
 
+resolve_mediafire() {
+  local url="$1"
+  local path file_id html direct_url filename direct_path
+
+  need_tool curl "macOS normally includes curl."
+
+  path="$(url_path "$url")"
+  case "$path" in
+    /file/*|/download/*)
+      file_id="${path#/file/}"
+      file_id="${file_id#/download/}"
+      file_id="${file_id%%/*}"
+      ;;
+    *)
+      die "Invalid MediaFire URL. Expected mediafire.com/file/<id>/<name>/file"
+      ;;
+  esac
+
+  [ -n "$file_id" ] || die "Could not extract MediaFire file ID from: ${url}"
+
+  note "MediaFire: resolving file ${file_id}"
+  if ! html="$(curl -fsSL -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" "$url")"; then
+    die "MediaFire page request failed"
+  fi
+
+  direct_url="$(printf '%s' "$html" | mediafire_direct_from_html || true)"
+  if [ -n "$direct_url" ]; then
+    direct_url="$(html_decode_if_possible "$direct_url")"
+  fi
+
+  case "$direct_url" in
+    http://*|https://*) ;;
+    *) die "Could not find MediaFire direct download URL in page" ;;
+  esac
+
+  filename="$(printf '%s' "$html" | mediafire_filename_from_html || true)"
+  if [ -n "$filename" ]; then
+    filename="$(html_decode_if_possible "$filename")"
+    filename="$(sanitize_provider_name "$filename")"
+  else
+    direct_path="$(url_path "$direct_url")"
+    filename="${direct_path##*/}"
+    filename="$(url_decode_if_possible "$filename")"
+    if [ -n "$filename" ]; then
+      filename="$(sanitize_provider_name "$filename")"
+    fi
+  fi
+
+  append_download "$direct_url" "$filename" "" "$url" "mediafire"
+  if [ -n "$filename" ]; then
+    note "MediaFire: resolved ${filename}"
+  else
+    note "MediaFire: resolved download endpoint"
+  fi
+}
+
 resolve_gofile() {
   local url="$1"
   local path content_id account_json account_status account_token
@@ -967,6 +1056,8 @@ resolve_input() {
     resolve_transferit "$item"
   elif is_yandexdisk "$item"; then
     resolve_yandexdisk "$item"
+  elif is_mediafire "$item"; then
+    resolve_mediafire "$item"
   else
     if is_torrent_like "$item" && ! has_uri_scheme "$item"; then
       case "$(lower "$item")" in
