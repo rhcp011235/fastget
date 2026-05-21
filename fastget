@@ -25,6 +25,7 @@ Examples:
   ${PROGRAM} -p secret https://www.swisstransfer.com/d/<id>
   ${PROGRAM} https://transfer.it/t/<id>
   ${PROGRAM} https://disk.yandex.com.tr/d/<id>
+  ${PROGRAM} https://drive.google.com/drive/folders/<id>
   ${PROGRAM} https://www.mediafire.com/file/<id>/<name>/file
   ${PROGRAM} https://www.mediafire.com/folder/<id>/<name>
   ${PROGRAM} --interface en9 https://example.com/huge.bin
@@ -33,9 +34,9 @@ Examples:
   ${PROGRAM} ./file.torrent
 
 Supported:
-  direct HTTP(S), Pixeldrain, Gofile, SwissTransfer, Google Drive, Seyarabata,
-  Transfer.it, Yandex Disk, MediaFire, magnet links, local .torrent files, and
-  remote .torrent URLs.
+  direct HTTP(S), Pixeldrain, Gofile, SwissTransfer, Google Drive file/folder,
+  Seyarabata, Transfer.it, Yandex Disk, MediaFire, magnet links, local .torrent
+  files, and remote .torrent URLs.
 
 Options:
   --sane                 Use a less aggressive aria2 profile.
@@ -463,11 +464,11 @@ transferit_api_error() {
 
 append_download() {
   local i="${#DL_URLS[@]}"
-  DL_URLS[$i]="$1"
-  DL_NAMES[$i]="$2"
-  DL_COOKIES[$i]="$3"
-  DL_ORIGINS[$i]="$4"
-  DL_PROVIDERS[$i]="$5"
+  DL_URLS[i]="$1"
+  DL_NAMES[i]="$2"
+  DL_COOKIES[i]="$3"
+  DL_ORIGINS[i]="$4"
+  DL_PROVIDERS[i]="$5"
 }
 
 resolve_pixeldrain() {
@@ -496,6 +497,11 @@ resolve_pixeldrain() {
   note "Pixeldrain: converted file ${file_id} to direct download URL"
 }
 
+gdrive_direct_url() {
+  local file_id="$1"
+  printf 'https://drive.usercontent.google.com/download?id=%s&export=download&confirm=t' "$file_id"
+}
+
 gdrive_filename_hint() {
   local direct_url="$1"
   local headers cd name
@@ -520,14 +526,106 @@ gdrive_filename_hint() {
   url_decode_if_possible "$name"
 }
 
+gdrive_folder_entries_from_html() {
+  python3 -c '
+import ast
+import json
+import re
+import sys
+
+html = sys.stdin.read()
+q = chr(39)
+pattern = (
+    r"window\[" + q + r"_DRIVE_ivd" + q + r"\]\s*=\s*" + q
+    + r"((?:\\.|[^" + q + r"])*)"
+    + q
+)
+match = re.search(pattern, html)
+if not match:
+    raise SystemExit(1)
+
+try:
+    raw = match.group(1).replace("\\/", "/")
+    decoded = ast.literal_eval(q + raw + q)
+    data = json.loads(decoded)
+except Exception:
+    raise SystemExit(1)
+
+items = data[0] if isinstance(data, list) and data and isinstance(data[0], list) else []
+for item in items:
+    if not isinstance(item, list) or len(item) < 4:
+        continue
+    file_id = item[0]
+    name = item[2]
+    mime = item[3]
+    if not isinstance(file_id, str) or not file_id:
+        continue
+    if not isinstance(name, str) or not name:
+        continue
+    if isinstance(mime, str) and mime.startswith("application/vnd.google-apps."):
+        continue
+    name = name.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    sys.stdout.write("{}\t{}\n".format(file_id, name))
+'
+}
+
+resolve_gdrive_folder() {
+  local url="$1"
+  local folder_id="$2"
+  local folder_url html rows tab row_file_id row_filename direct_url output_name before added
+
+  need_tool python3 "Install it with: brew install python"
+
+  folder_url="https://drive.google.com/drive/folders/${folder_id}"
+  note "Google Drive: resolving folder ${folder_id}"
+  if ! html="$(curl -fsSL -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" "$folder_url")"; then
+    die "Google Drive folder request failed"
+  fi
+
+  rows="$(printf '%s' "$html" | gdrive_folder_entries_from_html || true)"
+  [ -n "$rows" ] || die "No downloadable files found in Google Drive folder. The folder may be private, empty, or Google changed the public page format."
+
+  before="${#DL_URLS[@]}"
+  tab="$(printf '\t')"
+  while IFS="$tab" read -r row_file_id row_filename; do
+    [ -n "$row_file_id" ] || continue
+
+    direct_url="$(gdrive_direct_url "$row_file_id")"
+    output_name=""
+    if [ -n "$row_filename" ]; then
+      output_name="$(sanitize_provider_name "$row_filename")"
+    fi
+    append_download "$direct_url" "$output_name" "" "$url" "gdrive"
+  done <<EOF
+$rows
+EOF
+
+  added=$((${#DL_URLS[@]} - before))
+  [ "$added" -gt 0 ] || die "No downloadable files found in Google Drive folder"
+  note "Google Drive: ${added} file(s) resolved from folder ${folder_id}"
+}
+
 resolve_gdrive() {
   local url="$1"
-  local path file_id direct_url filename
+  local path file_id folder_id direct_url filename
 
   need_tool curl "macOS normally includes curl."
 
   path="$(url_path "$url")"
   case "$path" in
+    */folders/*)
+      folder_id="${path#*/folders/}"
+      folder_id="${folder_id%%/*}"
+      [ -n "$folder_id" ] || die "Could not extract Google Drive folder ID from: ${url}"
+      resolve_gdrive_folder "$url" "$folder_id"
+      return 0
+      ;;
+    /folderview)
+      folder_id="$(query_param "$url" "id" || true)"
+      [ -n "$folder_id" ] || die "Could not extract Google Drive folder ID from: ${url}"
+      resolve_gdrive_folder "$url" "$folder_id"
+      return 0
+      ;;
     */file/d/*)
       file_id="${path#*/file/d/}"
       file_id="${file_id%%/*}"
@@ -539,7 +637,7 @@ resolve_gdrive() {
 
   [ -n "$file_id" ] || die "Could not extract Google Drive file ID from: ${url}"
 
-  direct_url="https://drive.usercontent.google.com/download?id=${file_id}&export=download&confirm=t"
+  direct_url="$(gdrive_direct_url "$file_id")"
   filename="$(gdrive_filename_hint "$direct_url" || true)"
   if [ -n "$filename" ]; then
     filename="$(sanitize_provider_name "$filename")"
@@ -1267,10 +1365,10 @@ download_one() {
 
 batch_add_http() {
   local i="${#BATCH_URLS[@]}"
-  BATCH_URLS[$i]="$1"
-  BATCH_NAMES[$i]="$2"
-  BATCH_COOKIES[$i]="$3"
-  BATCH_PROVIDERS[$i]="$4"
+  BATCH_URLS[i]="$1"
+  BATCH_NAMES[i]="$2"
+  BATCH_COOKIES[i]="$3"
+  BATCH_PROVIDERS[i]="$4"
 }
 
 reset_http_batch() {
@@ -1525,6 +1623,7 @@ has_opt "--bt-tracker" && TORRENT_OPTS+=( --bt-tracker="${ARIA_BT_TRACKERS}" )
 DL_URLS=()
 DL_NAMES=()
 DL_COOKIES=()
+# shellcheck disable=SC2034 # Kept for future diagnostics and README-documented state.
 DL_ORIGINS=()
 DL_PROVIDERS=()
 reset_http_batch
