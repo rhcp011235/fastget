@@ -12,6 +12,7 @@ OUT_NAME=""
 PASSWORD="${FASTGET_PASSWORD:-}"
 FASTGET_INTERFACE="${FASTGET_INTERFACE:-}"
 FASTGET_PARALLEL="${FASTGET_PARALLEL:-}"
+GDRIVE_COOKIE_FROM_CLIPBOARD="${FASTGET_GDRIVE_COOKIE_FROM_CLIPBOARD:-}"
 INPUTS=()
 
 usage() {
@@ -45,6 +46,8 @@ Options:
   -p, --password VALUE   Password for Gofile, SwissTransfer, or Transfer.it.
   --interface IFACE      Bind aria2 sockets to an interface, e.g. en9 for 10GbE.
   --parallel N           Parallel HTTP files after provider resolution.
+  --gdrive-cookie-from-clipboard
+                         Parse Google Drive cookies from a copied cURL command.
   -h, --help             Show this help.
 
 Environment:
@@ -54,6 +57,8 @@ Environment:
   FASTGET_GDRIVE_COOKIE  Raw Cookie header for Google Drive account downloads.
   FASTGET_GDRIVE_COOKIE_FILE
                          Netscape/curl cookie jar for Google Drive downloads.
+  FASTGET_GDRIVE_COOKIE_FROM_CLIPBOARD
+                         Set to 1 to parse Google Drive cookies from clipboard.
   FASTGET_ULIMIT_NOFILE  Runtime file descriptor soft limit, default 8192.
   ARIA_CONN              Connections per server before aria2 cap clamping.
   ARIA_SPLIT             aria2 split count.
@@ -690,6 +695,63 @@ gdrive_user_cookie_header() {
     [ -r "$FASTGET_GDRIVE_COOKIE_FILE" ] || die "FASTGET_GDRIVE_COOKIE_FILE is not readable: ${FASTGET_GDRIVE_COOKIE_FILE}"
     gdrive_cookie_header_from_jar "$FASTGET_GDRIVE_COOKIE_FILE"
   fi
+}
+
+gdrive_cookie_from_curl_stdin() {
+  python3 -c '
+import shlex
+import sys
+
+try:
+    args = shlex.split(sys.stdin.read())
+except ValueError as exc:
+    raise SystemExit(f"could not parse clipboard cURL command: {exc}")
+
+
+def header_cookie(value):
+    if value.lower().startswith("cookie:"):
+        return value.split(":", 1)[1].strip()
+    return ""
+
+
+for i, arg in enumerate(args):
+    value = ""
+    if arg in ("-b", "--cookie") and i + 1 < len(args):
+        value = args[i + 1].strip()
+    elif arg.startswith("--cookie="):
+        value = arg.split("=", 1)[1].strip()
+    elif arg.startswith("-b") and len(arg) > 2:
+        value = arg[2:].strip()
+
+    if value:
+        print(value)
+        raise SystemExit
+
+    if arg in ("-H", "--header") and i + 1 < len(args):
+        value = header_cookie(args[i + 1])
+    elif arg.startswith("--header="):
+        value = header_cookie(arg.split("=", 1)[1])
+    elif arg.startswith("-H") and len(arg) > 2:
+        value = header_cookie(arg[2:])
+
+    if value:
+        print(value)
+        raise SystemExit
+
+raise SystemExit("no -b/--cookie or Cookie: header found in clipboard cURL command")
+'
+}
+
+load_gdrive_cookie_from_clipboard() {
+  local cookie
+
+  need_tool pbpaste "Copy the browser cURL command first, or set FASTGET_GDRIVE_COOKIE manually."
+  need_tool python3 "Install it with: brew install python"
+
+  cookie="$(pbpaste | gdrive_cookie_from_curl_stdin)"
+  [ -n "$cookie" ] || die "Could not extract Google Drive cookie from clipboard"
+  FASTGET_GDRIVE_COOKIE="$cookie"
+  note "Google Drive: loaded Cookie value from clipboard cURL command"
 }
 
 append_gdrive_file() {
@@ -1696,6 +1758,10 @@ while [ "$#" -gt 0 ]; do
       FASTGET_PARALLEL="${1#*=}"
       shift
       ;;
+    --gdrive-cookie-from-clipboard)
+      GDRIVE_COOKIE_FROM_CLIPBOARD=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -1725,6 +1791,10 @@ fi
 if [ -z "$PASSWORD" ] && [ "${#INPUTS[@]}" -eq 2 ] && is_password_provider "${INPUTS[0]}" && ! looks_like_source "${INPUTS[1]}"; then
   PASSWORD="${INPUTS[1]}"
   INPUTS=("${INPUTS[0]}")
+fi
+
+if [ "$GDRIVE_COOKIE_FROM_CLIPBOARD" = "1" ] || [ "$(lower "$GDRIVE_COOKIE_FROM_CLIPBOARD")" = "true" ]; then
+  load_gdrive_cookie_from_clipboard
 fi
 
 need_tool aria2c "Install it first with: brew install aria2"
