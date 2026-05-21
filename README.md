@@ -206,21 +206,31 @@ https://drive.usercontent.google.com/download?id=FILE_ID&export=download&confirm
   form action and uses the confirmed download URL. If Google returns a quota,
   access, or other HTML error page, `fastget` stops before `aria2c` so it does
   not save an HTML error page as the requested file.
-- If the link works in your signed-in browser but fails anonymously, set either
-  `FASTGET_GDRIVE_COOKIE` to a raw Google `Cookie:` header value or
-  `FASTGET_GDRIVE_COOKIE_FILE` to a Netscape/curl cookie jar exported from that
-  browser session. `fastget` uses those cookies for the Google Drive preflight
-  requests and passes them to `aria2c`.
-- On macOS, you can also copy Chrome's full `Copy as cURL` command to the
-  clipboard and run `fastget --gdrive-cookie-from-clipboard URL`. The cookie is
-  parsed locally from the clipboard, is not printed, and is saved to
+- If the link works in your signed-in browser but fails anonymously, `fastget`
+  can use your Google Drive browser session. Manual inputs are still supported:
+  set `FASTGET_GDRIVE_COOKIE` to a raw Google `Cookie:` header value, set
+  `FASTGET_GDRIVE_COOKIE_FILE` to a Netscape/curl cookie jar, or copy Chrome's
+  full `Copy as cURL` command and run
+  `fastget --gdrive-cookie-from-clipboard URL`.
+- On macOS, `fastget` can also load Google cookies directly from Google Chrome.
+  For a Google Drive URL, if no explicit cookie and no cached cookie are
+  available, it automatically tries Chrome. You can force this path with
+  `fastget --gdrive-cookie-from-chrome URL` or
+  `FASTGET_GDRIVE_COOKIE_FROM_CHROME=1 fastget URL`.
+- Chrome loading reads the Chrome cookies database from
+  `~/Library/Application Support/Google/Chrome/<profile>/Cookies`, copies it to
+  a temporary file so Chrome can stay open, reads Chrome's `Chrome Safe Storage`
+  item through the macOS `security` Keychain command, decrypts Google cookie
+  values with `openssl`, and builds the `Cookie:` header used for Drive
+  preflight requests and `aria2c`. macOS may prompt for Keychain permission.
+- By default, the Chrome profile is auto-detected with `Default` preferred. Set
+  `FASTGET_GDRIVE_CHROME_PROFILE="Profile 1"` or another Chrome profile
+  directory name when the signed-in Google account lives outside `Default`.
+- Cookies loaded from Chrome or from clipboard are saved to
   `~/.config/fastget/gdrive-cookie` with owner-only file permissions. Future
   Google Drive downloads automatically reuse that cached cookie until Google
-  expires it, so the copy step is normally only needed when the browser session
-  changes or a cached cookie stops working.
-- `fastget` does not read Chrome's cookie database or macOS Keychain directly.
-  Google account cookies are account session credentials, so the supported
-  convenience path is an explicit clipboard import followed by local caching.
+  expires it. Set `FASTGET_GDRIVE_COOKIE_CACHE_DISABLE=1` to prevent reading or
+  writing this cache.
 - For folder links, fetches the public folder HTML from Google Drive, extracts
   the embedded `_DRIVE_ivd` listing, skips subfolder and native Google Workspace
   entries, and appends one download job for each visible binary file in that
@@ -236,9 +246,10 @@ Limitations:
   files can still block downloads. `fastget` can detect and report those cases,
   but it cannot bypass Google quota or private-file restrictions.
 - Browser-only success usually means your browser is sending Google account
-  cookies. Use `fastget --gdrive-cookie-from-clipboard URL`,
-  `FASTGET_GDRIVE_COOKIE_FILE`, or `FASTGET_GDRIVE_COOKIE` when you
-  intentionally want `fastget` to use that same account session.
+  cookies. On macOS with Google Chrome installed, `fastget` now tries to load
+  those cookies automatically when needed. If that fails, use
+  `--gdrive-cookie-from-chrome`, `--gdrive-cookie-from-clipboard`,
+  `FASTGET_GDRIVE_COOKIE_FILE`, or `FASTGET_GDRIVE_COOKIE`.
 - Google Drive folder support reads the files exposed in the initial public
   folder page. It is not recursive, and very large folders that Google loads
   dynamically may need resolver updates if not all items are embedded in that
@@ -734,8 +745,14 @@ General:
 - `FASTGET_GDRIVE_COOKIE_FROM_CLIPBOARD`: set to `1` to parse a Google Drive
   cookie from a copied Chrome/Firefox cURL command on the macOS clipboard. This
   is the environment equivalent of `--gdrive-cookie-from-clipboard`.
-- `FASTGET_GDRIVE_COOKIE_CACHE`: path where a clipboard-imported Google Drive
-  cookie is cached for future Drive downloads. Default is
+- `FASTGET_GDRIVE_COOKIE_FROM_CHROME`: set to `1` to force loading Google Drive
+  cookies directly from Google Chrome on macOS. This is the environment
+  equivalent of `--gdrive-cookie-from-chrome`.
+- `FASTGET_GDRIVE_CHROME_PROFILE`: Chrome profile directory to read when using
+  Chrome cookie loading, for example `Default` or `Profile 1`. If unset,
+  `fastget` auto-detects available profiles and prefers `Default`.
+- `FASTGET_GDRIVE_COOKIE_CACHE`: path where Chrome-loaded or clipboard-imported
+  Google Drive cookies are cached for future Drive downloads. Default is
   `~/.config/fastget/gdrive-cookie`.
 - `FASTGET_GDRIVE_COOKIE_CACHE_DISABLE`: set to `1`, `true`, `yes`, or `on` to
   prevent reading or writing the Google Drive cookie cache.
@@ -816,11 +833,16 @@ Required for provider resolvers:
 Optional:
 
 - `python3`: used to URL-decode Google Drive filename hints, parse public Google
-  Drive folder listings and Google Drive warning/error pages, URL/base64url
-  encode Transfer.it filenames, and derive Transfer.it password tokens. If it is
-  missing, unprotected Transfer.it links still work, but filenames may fall back
-  to encoded text. Google Drive folder links, Drive warning-page handling, and
-  password-protected Transfer.it links require Python 3.
+  Drive folder listings and Google Drive warning/error pages, load/decrypt
+  Google Chrome cookies for Drive on macOS, URL/base64url encode Transfer.it
+  filenames, and derive Transfer.it password tokens. If it is missing,
+  unprotected Transfer.it links still work, but filenames may fall back to
+  encoded text. Google Drive folder links, Drive warning-page handling, Chrome
+  cookie loading, and password-protected Transfer.it links require Python 3.
+- `security`: macOS Keychain command used only for Google Drive Chrome cookie
+  loading.
+- `openssl`: used only for Google Drive Chrome cookie decryption. macOS normally
+  includes it.
 
 On macOS, `curl`, `shasum`, and `base64` are normally already present. Install
 the common missing tools with:
@@ -849,6 +871,14 @@ Key functions:
   password or another source.
 - `append_download`: adds resolved jobs to the internal arrays.
 - `resolve_pixeldrain`: converts Pixeldrain share URLs to API file URLs.
+- `load_gdrive_cookie_cache`: reuses the locally cached Google Drive cookie
+  before trying Chrome again.
+- `load_gdrive_cookie_from_clipboard`: parses a copied browser cURL command and
+  caches the extracted cookie.
+- `load_gdrive_cookie_from_chrome`: macOS Chrome integration. It copies the
+  Chrome cookies database, asks Keychain for Chrome Safe Storage through
+  `security`, decrypts Google cookies with `openssl`, and caches the resulting
+  `Cookie:` header.
 - `gdrive_folder_entries_from_html`: parses the embedded `_DRIVE_ivd` data from
   public Google Drive folder pages and emits visible binary file IDs and names.
 - `append_gdrive_file`: preflights a Drive file download, follows Google's
