@@ -51,6 +51,9 @@ Environment:
   FASTGET_PASSWORD       Password fallback for protected hosts.
   FASTGET_INTERFACE      Optional aria2 socket binding interface.
   FASTGET_PARALLEL       Parallel HTTP file downloads, default 4 aggressive.
+  FASTGET_GDRIVE_COOKIE  Raw Cookie header for Google Drive account downloads.
+  FASTGET_GDRIVE_COOKIE_FILE
+                         Netscape/curl cookie jar for Google Drive downloads.
   FASTGET_ULIMIT_NOFILE  Runtime file descriptor soft limit, default 8192.
   ARIA_CONN              Connections per server before aria2 cap clamping.
   ARIA_SPLIT             aria2 split count.
@@ -502,12 +505,9 @@ gdrive_direct_url() {
   printf 'https://drive.usercontent.google.com/download?id=%s&export=download&confirm=t' "$file_id"
 }
 
-gdrive_filename_hint() {
-  local direct_url="$1"
-  local headers cd name
-
-  headers="$(curl -fsSLI -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" "$direct_url" 2>/dev/null || true)"
-  [ -n "$headers" ] || return 1
+gdrive_filename_from_headers() {
+  local headers="$1"
+  local cd name
 
   cd="$(printf '%s\n' "$headers" | tr -d '\r' | grep -i '^content-disposition:' | tail -n 1 || true)"
   [ -n "$cd" ] || return 1
@@ -524,6 +524,236 @@ gdrive_filename_hint() {
   name="${name#\"}"
   [ -n "$name" ] || return 1
   url_decode_if_possible "$name"
+}
+
+gdrive_content_type_from_headers() {
+  local headers="$1"
+  printf '%s\n' "$headers" | tr -d '\r' | awk '
+    BEGIN { value = "" }
+    tolower($1) == "content-type:" {
+      $1 = ""
+      sub(/^[[:space:]]+/, "")
+      value = tolower($0)
+    }
+    END { print value }
+  '
+}
+
+gdrive_status_from_headers() {
+  local headers="$1"
+  printf '%s\n' "$headers" | tr -d '\r' | awk '
+    /^HTTP\// { code = $2 }
+    END { print code }
+  '
+}
+
+gdrive_curl_head() {
+  local url="$1"
+
+  if [ -n "${FASTGET_GDRIVE_COOKIE_FILE:-}" ]; then
+    [ -r "$FASTGET_GDRIVE_COOKIE_FILE" ] || die "FASTGET_GDRIVE_COOKIE_FILE is not readable: ${FASTGET_GDRIVE_COOKIE_FILE}"
+    curl -fsSLI -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" -b "$FASTGET_GDRIVE_COOKIE_FILE" "$url"
+  elif [ -n "${FASTGET_GDRIVE_COOKIE:-}" ]; then
+    curl -fsSLI -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" -H "Cookie: ${FASTGET_GDRIVE_COOKIE}" "$url"
+  else
+    curl -fsSLI -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" "$url"
+  fi
+}
+
+gdrive_curl_get() {
+  local url="$1"
+
+  if [ -n "${FASTGET_GDRIVE_COOKIE_FILE:-}" ]; then
+    [ -r "$FASTGET_GDRIVE_COOKIE_FILE" ] || die "FASTGET_GDRIVE_COOKIE_FILE is not readable: ${FASTGET_GDRIVE_COOKIE_FILE}"
+    curl -fsSL -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" -b "$FASTGET_GDRIVE_COOKIE_FILE" "$url"
+  elif [ -n "${FASTGET_GDRIVE_COOKIE:-}" ]; then
+    curl -fsSL -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" -H "Cookie: ${FASTGET_GDRIVE_COOKIE}" "$url"
+  else
+    curl -fsSL -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" "$url"
+  fi
+}
+
+gdrive_curl_get_with_jar() {
+  local url="$1"
+  local cookie_file="$2"
+
+  if [ -n "${FASTGET_GDRIVE_COOKIE_FILE:-}" ]; then
+    [ -r "$FASTGET_GDRIVE_COOKIE_FILE" ] || die "FASTGET_GDRIVE_COOKIE_FILE is not readable: ${FASTGET_GDRIVE_COOKIE_FILE}"
+    curl -fsSL -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" -b "$FASTGET_GDRIVE_COOKIE_FILE" -c "$cookie_file" "$url"
+  elif [ -n "${FASTGET_GDRIVE_COOKIE:-}" ]; then
+    curl -fsSL -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" -H "Cookie: ${FASTGET_GDRIVE_COOKIE}" -c "$cookie_file" "$url"
+  else
+    curl -fsSL -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" -b "$cookie_file" -c "$cookie_file" "$url"
+  fi
+}
+
+gdrive_interstitial_error_from_html() {
+  python3 -c '
+import html
+import re
+import sys
+
+page = sys.stdin.read()
+text = html.unescape(re.sub(r"<[^>]+>", " ", page))
+text = " ".join(text.split())
+lower = text.lower()
+
+if "quota exceeded" in lower or "too many users have viewed or downloaded" in lower:
+    print("Google Drive download quota exceeded for this file. Google says too many users have viewed or downloaded it recently; try again later or use a copy with fresh quota.")
+elif "you need access" in lower or "access denied" in lower or "request access" in lower:
+    print("Google Drive denied access to this file. The link may be private or require a signed-in account.")
+elif "sorry, you can" in lower and "view or download this file" in lower:
+    print("Google Drive is refusing this file right now. The link may be quota-limited, blocked, or require account access.")
+else:
+    raise SystemExit(1)
+'
+}
+
+gdrive_confirm_url_from_html() {
+  python3 -c '
+from html.parser import HTMLParser
+from urllib.parse import urlencode, urljoin
+import sys
+
+class Parser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.active = False
+        self.action = ""
+        self.params = []
+        self.link = ""
+
+    def handle_starttag(self, tag, attrs):
+        data = dict(attrs)
+        if tag == "form":
+            action = data.get("action", "")
+            form_id = data.get("id", "")
+            if form_id == "download-form" or "drive.usercontent.google.com" in action or "/uc" in action or "/download" in action:
+                self.active = True
+                self.action = action
+                self.params = []
+        elif tag == "input" and self.active:
+            name = data.get("name")
+            if name:
+                self.params.append((name, data.get("value", "")))
+        elif tag == "a" and data.get("id") == "uc-download-link":
+            href = data.get("href", "")
+            if href:
+                self.link = href
+
+    def handle_endtag(self, tag):
+        if tag == "form" and self.active:
+            self.active = False
+
+parser = Parser()
+parser.feed(sys.stdin.read())
+
+if parser.action and parser.params:
+    action = urljoin("https://drive.google.com", parser.action)
+    sep = "&" if "?" in action else "?"
+    print(action + sep + urlencode(parser.params))
+elif parser.link:
+    print(urljoin("https://drive.google.com", parser.link))
+else:
+    raise SystemExit(1)
+'
+}
+
+gdrive_cookie_header_from_jar() {
+  local cookie_file="$1"
+  awk '
+    BEGIN { sep = "" }
+    /^#HttpOnly_/ { sub(/^#HttpOnly_/, "", $1) }
+    /^#/ { next }
+    NF >= 7 {
+      printf "%s%s=%s", sep, $6, $7
+      sep = "; "
+    }
+  ' "$cookie_file"
+}
+
+join_cookie_headers() {
+  local first="$1"
+  local second="$2"
+
+  if [ -n "$first" ] && [ -n "$second" ]; then
+    printf '%s; %s' "$first" "$second"
+  else
+    printf '%s%s' "$first" "$second"
+  fi
+}
+
+gdrive_user_cookie_header() {
+  if [ -n "${FASTGET_GDRIVE_COOKIE:-}" ]; then
+    printf '%s' "$FASTGET_GDRIVE_COOKIE"
+  elif [ -n "${FASTGET_GDRIVE_COOKIE_FILE:-}" ]; then
+    [ -r "$FASTGET_GDRIVE_COOKIE_FILE" ] || die "FASTGET_GDRIVE_COOKIE_FILE is not readable: ${FASTGET_GDRIVE_COOKIE_FILE}"
+    gdrive_cookie_header_from_jar "$FASTGET_GDRIVE_COOKIE_FILE"
+  fi
+}
+
+append_gdrive_file() {
+  local origin="$1"
+  local file_id="$2"
+  local fallback_filename="${3-}"
+  local direct_url headers filename content_type status_code cookie_file page message confirm_url cookie_header user_cookie_header jar_cookie_header
+
+  direct_url="$(gdrive_direct_url "$file_id")"
+  headers="$(gdrive_curl_head "$direct_url" 2>/dev/null || true)"
+  filename="$(gdrive_filename_from_headers "$headers" || true)"
+
+  if [ -z "$filename" ]; then
+    filename="$fallback_filename"
+  fi
+
+  content_type="$(gdrive_content_type_from_headers "$headers")"
+  status_code="$(gdrive_status_from_headers "$headers")"
+  cookie_header="$(gdrive_user_cookie_header || true)"
+  case "$content_type" in
+    text/html*)
+      need_tool python3 "Install it with: brew install python"
+      cookie_file="$(mktemp "${TMPDIR:-/tmp}/fastget-gdrive-cookies.XXXXXX")" || die "Could not create temporary Google Drive cookie jar"
+      page="$(gdrive_curl_get_with_jar "$direct_url" "$cookie_file" 2>/dev/null || true)"
+
+      if message="$(printf '%s' "$page" | gdrive_interstitial_error_from_html 2>/dev/null)"; then
+        rm -f "$cookie_file"
+        die "$message"
+      fi
+
+      confirm_url="$(printf '%s' "$page" | gdrive_confirm_url_from_html 2>/dev/null || true)"
+      if [ -z "$confirm_url" ]; then
+        rm -f "$cookie_file"
+        die "Google Drive returned an HTML page instead of a file for ID ${file_id}. The link may require login, be quota-limited, or be blocked."
+      fi
+
+      direct_url="$confirm_url"
+      user_cookie_header="$(gdrive_user_cookie_header || true)"
+      jar_cookie_header="$(gdrive_cookie_header_from_jar "$cookie_file" || true)"
+      cookie_header="$(join_cookie_headers "$user_cookie_header" "$jar_cookie_header")"
+      headers="$(gdrive_curl_head "$direct_url" 2>/dev/null || true)"
+      rm -f "$cookie_file"
+
+      if [ -z "$filename" ]; then
+        filename="$(gdrive_filename_from_headers "$headers" || true)"
+      fi
+      status_code="$(gdrive_status_from_headers "$headers")"
+      ;;
+  esac
+
+  if is_uint "$status_code" && [ "$status_code" -ge 400 ]; then
+    die "Google Drive download endpoint returned HTTP ${status_code} for file ID ${file_id}. The file may be unavailable, private, quota-limited, or blocked."
+  fi
+
+  if [ -n "$filename" ]; then
+    filename="$(sanitize_provider_name "$filename")"
+  fi
+
+  append_download "$direct_url" "$filename" "$cookie_header" "$origin" "gdrive"
+  if [ -z "$filename" ]; then
+    note "Google Drive: resolved file ID ${file_id}"
+  else
+    note "Google Drive: resolved file ID ${file_id} -> ${filename}"
+  fi
 }
 
 gdrive_folder_entries_from_html() {
@@ -572,7 +802,7 @@ for item in items:
 resolve_gdrive_folder() {
   local url="$1"
   local folder_id="$2"
-  local folder_url html rows tab row_file_id row_filename direct_url output_name before added
+  local folder_url html rows tab row_file_id row_filename output_name before added
 
   need_tool python3 "Install it with: brew install python"
 
@@ -590,12 +820,11 @@ resolve_gdrive_folder() {
   while IFS="$tab" read -r row_file_id row_filename; do
     [ -n "$row_file_id" ] || continue
 
-    direct_url="$(gdrive_direct_url "$row_file_id")"
     output_name=""
     if [ -n "$row_filename" ]; then
       output_name="$(sanitize_provider_name "$row_filename")"
     fi
-    append_download "$direct_url" "$output_name" "" "$url" "gdrive"
+    append_gdrive_file "$url" "$row_file_id" "$output_name"
   done <<EOF
 $rows
 EOF
@@ -607,7 +836,7 @@ EOF
 
 resolve_gdrive() {
   local url="$1"
-  local path file_id folder_id direct_url filename
+  local path file_id folder_id
 
   need_tool curl "macOS normally includes curl."
 
@@ -637,18 +866,7 @@ resolve_gdrive() {
 
   [ -n "$file_id" ] || die "Could not extract Google Drive file ID from: ${url}"
 
-  direct_url="$(gdrive_direct_url "$file_id")"
-  filename="$(gdrive_filename_hint "$direct_url" || true)"
-  if [ -n "$filename" ]; then
-    filename="$(sanitize_provider_name "$filename")"
-  fi
-
-  append_download "$direct_url" "$filename" "" "$url" "gdrive"
-  if [ -z "$filename" ]; then
-    note "Google Drive: resolved file ID ${file_id}"
-  else
-    note "Google Drive: resolved file ID ${file_id} -> ${filename}"
-  fi
+  append_gdrive_file "$url" "$file_id"
 }
 
 seyarabata_filename_from_html() {
