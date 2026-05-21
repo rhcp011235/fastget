@@ -13,6 +13,7 @@ PASSWORD="${FASTGET_PASSWORD:-}"
 FASTGET_INTERFACE="${FASTGET_INTERFACE:-}"
 FASTGET_PARALLEL="${FASTGET_PARALLEL:-}"
 GDRIVE_COOKIE_FROM_CLIPBOARD="${FASTGET_GDRIVE_COOKIE_FROM_CLIPBOARD:-}"
+GDRIVE_COOKIE_FROM_CHROME="${FASTGET_GDRIVE_COOKIE_FROM_CHROME:-}"
 FASTGET_GDRIVE_COOKIE_CACHE="${FASTGET_GDRIVE_COOKIE_CACHE:-${XDG_CONFIG_HOME:-$HOME/.config}/fastget/gdrive-cookie}"
 FASTGET_GDRIVE_COOKIE_CACHE_DISABLE="${FASTGET_GDRIVE_COOKIE_CACHE_DISABLE:-}"
 INPUTS=()
@@ -50,6 +51,8 @@ Options:
   --parallel N           Parallel HTTP files after provider resolution.
   --gdrive-cookie-from-clipboard
                          Parse and cache Google Drive cookies from copied cURL.
+  --gdrive-cookie-from-chrome
+                         Read Google Drive cookies directly from Chrome (macOS).
   -h, --help             Show this help.
 
 Environment:
@@ -61,6 +64,10 @@ Environment:
                          Netscape/curl cookie jar for Google Drive downloads.
   FASTGET_GDRIVE_COOKIE_FROM_CLIPBOARD
                          Set to 1 to parse/cache Google Drive cookies from clipboard.
+  FASTGET_GDRIVE_COOKIE_FROM_CHROME
+                         Set to 1 to read Google Drive cookies from Chrome (macOS).
+  FASTGET_GDRIVE_CHROME_PROFILE
+                         Chrome profile directory name (e.g. "Default", "Profile 1").
   FASTGET_GDRIVE_COOKIE_CACHE
                          Cookie cache path, default ~/.config/fastget/gdrive-cookie.
   FASTGET_GDRIVE_COOKIE_CACHE_DISABLE
@@ -803,6 +810,160 @@ load_gdrive_cookie_from_clipboard() {
   [ -n "$cookie" ] || die "Could not extract Google Drive cookie from clipboard"
   FASTGET_GDRIVE_COOKIE="$cookie"
   note "Google Drive: loaded Cookie value from clipboard cURL command"
+  save_gdrive_cookie_cache "$cookie"
+}
+
+load_gdrive_cookie_from_chrome() {
+  local chrome_profile cookie
+
+  need_tool python3 "Install it with: brew install python"
+  need_tool security "This feature requires macOS (the 'security' keychain command is not available)."
+  need_tool openssl "macOS normally includes openssl."
+
+  chrome_profile="${FASTGET_GDRIVE_CHROME_PROFILE:-}"
+
+  cookie="$(python3 - "$chrome_profile" <<'PY'
+import hashlib
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+
+
+def get_keychain_password():
+    result = subprocess.run(
+        ["security", "find-generic-password", "-w",
+         "-s", "Chrome Safe Storage", "-a", "Chrome"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise SystemExit(
+            "Could not read Chrome Safe Storage from Keychain. "
+            "Make sure Google Chrome is installed and you have granted access."
+        )
+    return result.stdout.strip()
+
+
+def derive_key(password):
+    return hashlib.pbkdf2_hmac("sha1", password.encode("utf-8"), b"saltysalt", 1003, 16)
+
+
+def is_safe_cookie_value(text):
+    """Cookie values must be printable ASCII; reject binary garbage."""
+    return bool(text) and all(0x20 <= ord(c) <= 0x7E for c in text)
+
+
+def decrypt_cookie_value(encrypted_value, key):
+    if not encrypted_value:
+        return None
+    if not encrypted_value.startswith(b"v1"):
+        # Unencrypted - plain text stored in encrypted_value column
+        try:
+            text = encrypted_value.decode("utf-8")
+            return text if is_safe_cookie_value(text) else None
+        except UnicodeDecodeError:
+            return None
+    # Chrome macOS cookie format (Chrome 127+):
+    #   v10 (3 bytes) + 16-byte header + 16-byte per-cookie IV + AES-128-CBC ciphertext
+    # Earlier versions used a fixed space IV with no header, but all modern cookies
+    # embed the IV at offset 16 within the encrypted blob.
+    raw = encrypted_value[3:]  # strip v10/v11 prefix
+    if len(raw) < 33:
+        return None
+    iv = raw[16:32]
+    ciphertext = raw[32:]
+    if len(ciphertext) % 16 != 0:
+        return None
+    result = subprocess.run(
+        ["openssl", "enc", "-d", "-aes-128-cbc",
+         "-K", key.hex(), "-iv", iv.hex(), "-nosalt"],
+        input=ciphertext,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        text = result.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    return text if is_safe_cookie_value(text) else None
+
+
+def find_cookies_db(profile_hint):
+    home = os.path.expanduser("~")
+    base = os.path.join(home, "Library", "Application Support", "Google", "Chrome")
+    if profile_hint:
+        candidate = os.path.join(base, profile_hint, "Cookies")
+        if os.path.exists(candidate):
+            return candidate
+        raise SystemExit(f"Chrome cookies DB not found at: {candidate}")
+    candidates = []
+    if os.path.isdir(base):
+        for entry in os.listdir(base):
+            p = os.path.join(base, entry, "Cookies")
+            if os.path.exists(p):
+                candidates.append((entry, p))
+    candidates.sort(key=lambda x: (x[0] != "Default", x[0]))
+    if not candidates:
+        raise SystemExit(
+            "Chrome cookies database not found. Is Google Chrome installed?"
+        )
+    return candidates[0][1]
+
+
+def main():
+    profile_hint = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else ""
+    password = get_keychain_password()
+    key = derive_key(password)
+    cookies_path = find_cookies_db(profile_hint)
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            tmp_path = f.name
+        shutil.copy2(cookies_path, tmp_path)
+
+        conn = sqlite3.connect(f"file:{tmp_path}?mode=ro", uri=True)
+        cursor = conn.execute(
+            "SELECT name, encrypted_value, value FROM cookies "
+            "WHERE host_key LIKE '%.google.com' OR host_key = 'google.com' "
+            "ORDER BY host_key, name"
+        )
+
+        parts = []
+        for name, encrypted_value, plain_value in cursor:
+            if encrypted_value:
+                value = decrypt_cookie_value(encrypted_value, key)
+            else:
+                value = plain_value or ""
+            if value and name and is_safe_cookie_value(value):
+                parts.append(f"{name}={value}")
+
+        conn.close()
+
+        if not parts:
+            raise SystemExit(
+                "No Google cookies found in Chrome. "
+                "Make sure you are signed in to Google in Chrome."
+            )
+
+        print("; ".join(parts))
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+main()
+PY
+)"
+  [ -n "$cookie" ] || die "Could not extract Google Drive cookies from Chrome"
+  FASTGET_GDRIVE_COOKIE="$cookie"
+  note "Google Drive: loaded Cookie from Chrome"
   save_gdrive_cookie_cache "$cookie"
 }
 
@@ -1814,6 +1975,10 @@ while [ "$#" -gt 0 ]; do
       GDRIVE_COOKIE_FROM_CLIPBOARD=1
       shift
       ;;
+    --gdrive-cookie-from-chrome)
+      GDRIVE_COOKIE_FROM_CHROME=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -1847,8 +2012,15 @@ fi
 
 if [ "$GDRIVE_COOKIE_FROM_CLIPBOARD" = "1" ] || [ "$(lower "$GDRIVE_COOKIE_FROM_CLIPBOARD")" = "true" ]; then
   load_gdrive_cookie_from_clipboard
+elif [ "$GDRIVE_COOKIE_FROM_CHROME" = "1" ] || [ "$(lower "$GDRIVE_COOKIE_FROM_CHROME")" = "true" ]; then
+  load_gdrive_cookie_from_chrome
 elif inputs_include_gdrive; then
   load_gdrive_cookie_cache
+  if [ -z "${FASTGET_GDRIVE_COOKIE:-}" ] && [ -z "${FASTGET_GDRIVE_COOKIE_FILE:-}" ]; then
+    if command -v security >/dev/null 2>&1; then
+      load_gdrive_cookie_from_chrome
+    fi
+  fi
 fi
 
 need_tool aria2c "Install it first with: brew install aria2"
