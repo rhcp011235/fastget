@@ -211,6 +211,9 @@ https://drive.usercontent.google.com/download?id=FILE_ID&export=download&confirm
   `FASTGET_GDRIVE_COOKIE_FILE` to a Netscape/curl cookie jar exported from that
   browser session. `fastget` uses those cookies for the Google Drive preflight
   requests and passes them to `aria2c`.
+- On macOS, you can also copy Chrome's full `Copy as cURL` command to the
+  clipboard and run `fastget --gdrive-cookie-from-clipboard URL`. The cookie is
+  parsed locally from the clipboard and is not printed.
 - For folder links, fetches the public folder HTML from Google Drive, extracts
   the embedded `_DRIVE_ivd` listing, skips subfolder and native Google Workspace
   entries, and appends one download job for each visible binary file in that
@@ -720,6 +723,9 @@ General:
   Google Drive files. This is the safer option when exporting browser cookies,
   because `fastget` can also reuse any temporary Drive cookies from warning
   pages.
+- `FASTGET_GDRIVE_COOKIE_FROM_CLIPBOARD`: set to `1` to parse a Google Drive
+  cookie from a copied Chrome/Firefox cURL command on the macOS clipboard. This
+  is the environment equivalent of `--gdrive-cookie-from-clipboard`.
 - `FASTGET_ULIMIT_NOFILE`: runtime soft file descriptor target. Default is
   `8192`.
 - `FASTGET_USER_AGENT`: HTTP user agent. Default is `Mozilla/5.0`.
