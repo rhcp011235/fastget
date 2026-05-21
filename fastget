@@ -13,6 +13,8 @@ PASSWORD="${FASTGET_PASSWORD:-}"
 FASTGET_INTERFACE="${FASTGET_INTERFACE:-}"
 FASTGET_PARALLEL="${FASTGET_PARALLEL:-}"
 GDRIVE_COOKIE_FROM_CLIPBOARD="${FASTGET_GDRIVE_COOKIE_FROM_CLIPBOARD:-}"
+FASTGET_GDRIVE_COOKIE_CACHE="${FASTGET_GDRIVE_COOKIE_CACHE:-${XDG_CONFIG_HOME:-$HOME/.config}/fastget/gdrive-cookie}"
+FASTGET_GDRIVE_COOKIE_CACHE_DISABLE="${FASTGET_GDRIVE_COOKIE_CACHE_DISABLE:-}"
 INPUTS=()
 
 usage() {
@@ -47,7 +49,7 @@ Options:
   --interface IFACE      Bind aria2 sockets to an interface, e.g. en9 for 10GbE.
   --parallel N           Parallel HTTP files after provider resolution.
   --gdrive-cookie-from-clipboard
-                         Parse Google Drive cookies from a copied cURL command.
+                         Parse and cache Google Drive cookies from copied cURL.
   -h, --help             Show this help.
 
 Environment:
@@ -58,7 +60,11 @@ Environment:
   FASTGET_GDRIVE_COOKIE_FILE
                          Netscape/curl cookie jar for Google Drive downloads.
   FASTGET_GDRIVE_COOKIE_FROM_CLIPBOARD
-                         Set to 1 to parse Google Drive cookies from clipboard.
+                         Set to 1 to parse/cache Google Drive cookies from clipboard.
+  FASTGET_GDRIVE_COOKIE_CACHE
+                         Cookie cache path, default ~/.config/fastget/gdrive-cookie.
+  FASTGET_GDRIVE_COOKIE_CACHE_DISABLE
+                         Set to 1 to disable the Google Drive cookie cache.
   FASTGET_ULIMIT_NOFILE  Runtime file descriptor soft limit, default 8192.
   ARIA_CONN              Connections per server before aria2 cap clamping.
   ARIA_SPLIT             aria2 split count.
@@ -697,6 +703,51 @@ gdrive_user_cookie_header() {
   fi
 }
 
+gdrive_cookie_cache_enabled() {
+  case "$(lower "$FASTGET_GDRIVE_COOKIE_CACHE_DISABLE")" in
+    1|true|yes|on) return 1 ;;
+    *) [ -n "$FASTGET_GDRIVE_COOKIE_CACHE" ] ;;
+  esac
+}
+
+save_gdrive_cookie_cache() {
+  local cookie="$1"
+  local cache_dir
+
+  gdrive_cookie_cache_enabled || return 0
+  cache_dir="${FASTGET_GDRIVE_COOKIE_CACHE%/*}"
+  [ -n "$cache_dir" ] && [ "$cache_dir" != "$FASTGET_GDRIVE_COOKIE_CACHE" ] || return 0
+
+  mkdir -p "$cache_dir"
+  (
+    umask 077
+    printf '%s\n' "$cookie" >"$FASTGET_GDRIVE_COOKIE_CACHE"
+  )
+  chmod 600 "$FASTGET_GDRIVE_COOKIE_CACHE" 2>/dev/null || true
+  note "Google Drive: saved Cookie value to ${FASTGET_GDRIVE_COOKIE_CACHE}"
+}
+
+load_gdrive_cookie_cache() {
+  [ -z "${FASTGET_GDRIVE_COOKIE:-}" ] || return 0
+  [ -z "${FASTGET_GDRIVE_COOKIE_FILE:-}" ] || return 0
+  gdrive_cookie_cache_enabled || return 0
+  [ -r "$FASTGET_GDRIVE_COOKIE_CACHE" ] || return 0
+
+  IFS= read -r FASTGET_GDRIVE_COOKIE <"$FASTGET_GDRIVE_COOKIE_CACHE" || true
+  [ -n "$FASTGET_GDRIVE_COOKIE" ] || return 0
+  note "Google Drive: using cached Cookie value from ${FASTGET_GDRIVE_COOKIE_CACHE}"
+}
+
+inputs_include_gdrive() {
+  local input
+  for input in "${INPUTS[@]}"; do
+    if is_gdrive "$input"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 gdrive_cookie_from_curl_stdin() {
   python3 -c '
 import shlex
@@ -752,6 +803,7 @@ load_gdrive_cookie_from_clipboard() {
   [ -n "$cookie" ] || die "Could not extract Google Drive cookie from clipboard"
   FASTGET_GDRIVE_COOKIE="$cookie"
   note "Google Drive: loaded Cookie value from clipboard cURL command"
+  save_gdrive_cookie_cache "$cookie"
 }
 
 append_gdrive_file() {
@@ -1795,6 +1847,8 @@ fi
 
 if [ "$GDRIVE_COOKIE_FROM_CLIPBOARD" = "1" ] || [ "$(lower "$GDRIVE_COOKIE_FROM_CLIPBOARD")" = "true" ]; then
   load_gdrive_cookie_from_clipboard
+elif inputs_include_gdrive; then
+  load_gdrive_cookie_cache
 fi
 
 need_tool aria2c "Install it first with: brew install aria2"

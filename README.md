@@ -213,7 +213,14 @@ https://drive.usercontent.google.com/download?id=FILE_ID&export=download&confirm
   requests and passes them to `aria2c`.
 - On macOS, you can also copy Chrome's full `Copy as cURL` command to the
   clipboard and run `fastget --gdrive-cookie-from-clipboard URL`. The cookie is
-  parsed locally from the clipboard and is not printed.
+  parsed locally from the clipboard, is not printed, and is saved to
+  `~/.config/fastget/gdrive-cookie` with owner-only file permissions. Future
+  Google Drive downloads automatically reuse that cached cookie until Google
+  expires it, so the copy step is normally only needed when the browser session
+  changes or a cached cookie stops working.
+- `fastget` does not read Chrome's cookie database or macOS Keychain directly.
+  Google account cookies are account session credentials, so the supported
+  convenience path is an explicit clipboard import followed by local caching.
 - For folder links, fetches the public folder HTML from Google Drive, extracts
   the embedded `_DRIVE_ivd` listing, skips subfolder and native Google Workspace
   entries, and appends one download job for each visible binary file in that
@@ -229,7 +236,8 @@ Limitations:
   files can still block downloads. `fastget` can detect and report those cases,
   but it cannot bypass Google quota or private-file restrictions.
 - Browser-only success usually means your browser is sending Google account
-  cookies. Use `FASTGET_GDRIVE_COOKIE_FILE` or `FASTGET_GDRIVE_COOKIE` when you
+  cookies. Use `fastget --gdrive-cookie-from-clipboard URL`,
+  `FASTGET_GDRIVE_COOKIE_FILE`, or `FASTGET_GDRIVE_COOKIE` when you
   intentionally want `fastget` to use that same account session.
 - Google Drive folder support reads the files exposed in the initial public
   folder page. It is not recursive, and very large folders that Google loads
@@ -726,6 +734,11 @@ General:
 - `FASTGET_GDRIVE_COOKIE_FROM_CLIPBOARD`: set to `1` to parse a Google Drive
   cookie from a copied Chrome/Firefox cURL command on the macOS clipboard. This
   is the environment equivalent of `--gdrive-cookie-from-clipboard`.
+- `FASTGET_GDRIVE_COOKIE_CACHE`: path where a clipboard-imported Google Drive
+  cookie is cached for future Drive downloads. Default is
+  `~/.config/fastget/gdrive-cookie`.
+- `FASTGET_GDRIVE_COOKIE_CACHE_DISABLE`: set to `1`, `true`, `yes`, or `on` to
+  prevent reading or writing the Google Drive cookie cache.
 - `FASTGET_ULIMIT_NOFILE`: runtime soft file descriptor target. Default is
   `8192`.
 - `FASTGET_USER_AGENT`: HTTP user agent. Default is `Mozilla/5.0`.
