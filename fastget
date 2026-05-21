@@ -967,6 +967,41 @@ PY
   save_gdrive_cookie_cache "$cookie"
 }
 
+gdrive_verify_not_html() {
+  local url="$1"
+  local cookie_header="${2-}"
+  local file_id="${3-}"
+  local sample message
+
+  # Google can return an HTML error page (quota, access denied) with a 200 status
+  # and a binary-looking Content-Type on HEAD — meaning the HEAD check passes but
+  # aria2c then saves an HTML page as the output file.  Fetch the first 1 KB via
+  # a range GET to detect this before handing the URL to aria2c.
+  if [ -n "$cookie_header" ]; then
+    sample="$(curl -sSL --range 0-1023 --max-time 15 \
+      -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" \
+      -H "Cookie: ${cookie_header}" \
+      "$url" 2>/dev/null || true)"
+  else
+    sample="$(curl -sSL --range 0-1023 --max-time 15 \
+      -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" \
+      "$url" 2>/dev/null || true)"
+  fi
+
+  [ -n "$sample" ] || return 0
+
+  case "$sample" in
+    '<!DOCTYPE '*|'<!doctype '*|'<html>'*|'<html '*|'<HTML'*)
+      if command -v python3 >/dev/null 2>&1; then
+        if message="$(printf '%s' "$sample" | gdrive_interstitial_error_from_html 2>/dev/null)"; then
+          die "$message"
+        fi
+      fi
+      die "Google Drive returned an HTML page instead of the file${file_id:+ (ID ${file_id})}. The link may be quota-limited, private, or unavailable."
+      ;;
+  esac
+}
+
 append_gdrive_file() {
   local origin="$1"
   local file_id="$2"
@@ -1023,6 +1058,7 @@ append_gdrive_file() {
     filename="$(sanitize_provider_name "$filename")"
   fi
 
+  gdrive_verify_not_html "$direct_url" "$cookie_header" "$file_id"
   append_download "$direct_url" "$filename" "$cookie_header" "$origin" "gdrive"
   if [ -z "$filename" ]; then
     note "Google Drive: resolved file ID ${file_id}"
