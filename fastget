@@ -969,21 +969,27 @@ PY
 
 gdrive_verify_not_html() {
   local url="$1"
-  local cookie_header="${2-}"
-  local file_id="${3-}"
+  local file_id="${2-}"
   local sample message
 
   # Google can return an HTML error page (quota, access denied) with a 200 status
-  # and a binary-looking Content-Type on HEAD — meaning the HEAD check passes but
-  # aria2c then saves an HTML page as the output file.  Fetch the first 1 KB via
-  # a range GET to detect this before handing the URL to aria2c.
-  if [ -n "$cookie_header" ]; then
-    sample="$(curl -sSL --range 0-1023 --max-time 15 \
+  # and a binary-looking Content-Type on HEAD requests, causing aria2c to silently
+  # save an HTML page as the output file.  Do a capped GET (same cookie logic as
+  # gdrive_curl_head) to detect this before handing the URL to aria2c.
+  # --max-filesize caps at 64 KB: HTML error pages are small and download fully;
+  # real files trigger a curl error so sample stays empty and we skip the check.
+  if [ -n "${FASTGET_GDRIVE_COOKIE_FILE:-}" ]; then
+    sample="$(curl -sSL --max-filesize 65536 --max-time 15 \
       -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" \
-      -H "Cookie: ${cookie_header}" \
+      -b "$FASTGET_GDRIVE_COOKIE_FILE" \
+      "$url" 2>/dev/null || true)"
+  elif [ -n "${FASTGET_GDRIVE_COOKIE:-}" ]; then
+    sample="$(curl -sSL --max-filesize 65536 --max-time 15 \
+      -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" \
+      -H "Cookie: ${FASTGET_GDRIVE_COOKIE}" \
       "$url" 2>/dev/null || true)"
   else
-    sample="$(curl -sSL --range 0-1023 --max-time 15 \
+    sample="$(curl -sSL --max-filesize 65536 --max-time 15 \
       -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" \
       "$url" 2>/dev/null || true)"
   fi
@@ -1058,7 +1064,7 @@ append_gdrive_file() {
     filename="$(sanitize_provider_name "$filename")"
   fi
 
-  gdrive_verify_not_html "$direct_url" "$cookie_header" "$file_id"
+  gdrive_verify_not_html "$direct_url" "$file_id"
   append_download "$direct_url" "$filename" "$cookie_header" "$origin" "gdrive"
   if [ -z "$filename" ]; then
     note "Google Drive: resolved file ID ${file_id}"
