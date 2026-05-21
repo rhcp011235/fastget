@@ -201,6 +201,16 @@ https://drive.usercontent.google.com/download?id=FILE_ID&export=download&confirm
   `Content-Disposition`.
 - If the filename is learned, it is passed to `aria2c` with `-o`.
 - If the filename cannot be learned, `aria2c` chooses the name.
+- For file links, preflights the Google download endpoint before starting
+  `aria2c`. If Google returns a current warning form, `fastget` extracts that
+  form action and uses the confirmed download URL. If Google returns a quota,
+  access, or other HTML error page, `fastget` stops before `aria2c` so it does
+  not save an HTML error page as the requested file.
+- If the link works in your signed-in browser but fails anonymously, set either
+  `FASTGET_GDRIVE_COOKIE` to a raw Google `Cookie:` header value or
+  `FASTGET_GDRIVE_COOKIE_FILE` to a Netscape/curl cookie jar exported from that
+  browser session. `fastget` uses those cookies for the Google Drive preflight
+  requests and passes them to `aria2c`.
 - For folder links, fetches the public folder HTML from Google Drive, extracts
   the embedded `_DRIVE_ivd` listing, skips subfolder and native Google Workspace
   entries, and appends one download job for each visible binary file in that
@@ -213,7 +223,11 @@ Limitations:
 
 - This is for public or otherwise accessible file links.
 - Google Drive quota, virus scan interstitials, permission pages, or account-only
-  files can still block downloads.
+  files can still block downloads. `fastget` can detect and report those cases,
+  but it cannot bypass Google quota or private-file restrictions.
+- Browser-only success usually means your browser is sending Google account
+  cookies. Use `FASTGET_GDRIVE_COOKIE_FILE` or `FASTGET_GDRIVE_COOKIE` when you
+  intentionally want `fastget` to use that same account session.
 - Google Drive folder support reads the files exposed in the initial public
   folder page. It is not recursive, and very large folders that Google loads
   dynamically may need resolver updates if not all items are embedded in that
@@ -700,6 +714,12 @@ General:
   `en9` for the 10GbE Thunderbolt Ethernet port.
 - `FASTGET_PARALLEL`: parallel HTTP file downloads after provider resolution.
   Default is `4` aggressive and `1` sane.
+- `FASTGET_GDRIVE_COOKIE`: raw Google Drive `Cookie:` header value to use for
+  Drive files that require your signed-in browser session.
+- `FASTGET_GDRIVE_COOKIE_FILE`: path to a Netscape/curl cookie jar to use for
+  Google Drive files. This is the safer option when exporting browser cookies,
+  because `fastget` can also reuse any temporary Drive cookies from warning
+  pages.
 - `FASTGET_ULIMIT_NOFILE`: runtime soft file descriptor target. Default is
   `8192`.
 - `FASTGET_USER_AGENT`: HTTP user agent. Default is `Mozilla/5.0`.
@@ -777,10 +797,11 @@ Required for provider resolvers:
 Optional:
 
 - `python3`: used to URL-decode Google Drive filename hints, parse public Google
-  Drive folder listings, URL/base64url encode Transfer.it filenames, and derive
-  Transfer.it password tokens. If it is missing, unprotected Transfer.it links
-  still work, but filenames may fall back to encoded text. Google Drive folder
-  links and password-protected Transfer.it links require Python 3.
+  Drive folder listings and Google Drive warning/error pages, URL/base64url
+  encode Transfer.it filenames, and derive Transfer.it password tokens. If it is
+  missing, unprotected Transfer.it links still work, but filenames may fall back
+  to encoded text. Google Drive folder links, Drive warning-page handling, and
+  password-protected Transfer.it links require Python 3.
 
 On macOS, `curl`, `shasum`, and `base64` are normally already present. Install
 the common missing tools with:
@@ -811,6 +832,9 @@ Key functions:
 - `resolve_pixeldrain`: converts Pixeldrain share URLs to API file URLs.
 - `gdrive_folder_entries_from_html`: parses the embedded `_DRIVE_ivd` data from
   public Google Drive folder pages and emits visible binary file IDs and names.
+- `append_gdrive_file`: preflights a Drive file download, follows Google's
+  current warning form when available, detects quota/access HTML pages, and adds
+  the final file job.
 - `resolve_gdrive`: extracts Drive file IDs, expands public Drive folder
   listings, and builds direct download URLs.
 - `resolve_gofile`: creates a guest account, fetches content metadata, walks
@@ -951,7 +975,8 @@ part of normal use.
   this README together.
 - Google Drive can still block files that require login, exceed quota, show
   non-download interstitial pages, or hide folder contents from the public HTML
-  listing.
+  listing. `fastget` reports known Drive quota/access pages; it does not bypass
+  those server-side limits.
 - Seyarabata support depends on the current `/t/FILE_ID` preview page and
   `/d/FILE_ID` redirect behavior.
 - Transfer.it support depends on the current `xi`, `f`, `xv`, and `g` API
