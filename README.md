@@ -11,7 +11,7 @@ Current supported input types:
 - Pixeldrain share links.
 - Gofile folder/file links.
 - SwissTransfer transfer links.
-- Google Drive file links.
+- Google Drive file and folder links.
 - Seyarabata file links.
 - Transfer.it transfer links.
 - Yandex Disk public links.
@@ -180,6 +180,14 @@ https://drive.google.com/uc?id=FILE_ID
 https://drive.usercontent.google.com/download?id=FILE_ID
 ```
 
+Supported public folder formats:
+
+```text
+https://drive.google.com/drive/folders/FOLDER_ID
+https://drive.google.com/drive/u/0/folders/FOLDER_ID
+https://drive.google.com/folderview?id=FOLDER_ID
+```
+
 Resolver behavior:
 
 - Extracts the file ID from `/file/d/...` or from the `id=` query parameter.
@@ -193,12 +201,25 @@ https://drive.usercontent.google.com/download?id=FILE_ID&export=download&confirm
   `Content-Disposition`.
 - If the filename is learned, it is passed to `aria2c` with `-o`.
 - If the filename cannot be learned, `aria2c` chooses the name.
+- For folder links, fetches the public folder HTML from Google Drive, extracts
+  the embedded `_DRIVE_ivd` listing, skips subfolder and native Google Workspace
+  entries, and appends one download job for each visible binary file in that
+  listing.
+- Folder filenames come from the public folder listing, so multi-file Drive
+  folders keep useful names without requiring a separate `HEAD` request per
+  item.
 
 Limitations:
 
 - This is for public or otherwise accessible file links.
 - Google Drive quota, virus scan interstitials, permission pages, or account-only
   files can still block downloads.
+- Google Drive folder support reads the files exposed in the initial public
+  folder page. It is not recursive, and very large folders that Google loads
+  dynamically may need resolver updates if not all items are embedded in that
+  page.
+- Native Google Docs/Sheets/Slides entries are not exported through this
+  resolver. Downloadable binary files are the intended target.
 
 ### Gofile
 
@@ -755,10 +776,11 @@ Required for provider resolvers:
 
 Optional:
 
-- `python3`: used to URL-decode Google Drive filename hints, URL/base64url
-  encode Transfer.it filenames, and derive Transfer.it password tokens. If it is
-  missing, unprotected Transfer.it links still work, but filenames may fall back
-  to encoded text. Password-protected Transfer.it links require Python 3.
+- `python3`: used to URL-decode Google Drive filename hints, parse public Google
+  Drive folder listings, URL/base64url encode Transfer.it filenames, and derive
+  Transfer.it password tokens. If it is missing, unprotected Transfer.it links
+  still work, but filenames may fall back to encoded text. Google Drive folder
+  links and password-protected Transfer.it links require Python 3.
 
 On macOS, `curl`, `shasum`, and `base64` are normally already present. Install
 the common missing tools with:
@@ -787,7 +809,10 @@ Key functions:
   password or another source.
 - `append_download`: adds resolved jobs to the internal arrays.
 - `resolve_pixeldrain`: converts Pixeldrain share URLs to API file URLs.
-- `resolve_gdrive`: extracts Drive file IDs and builds direct download URLs.
+- `gdrive_folder_entries_from_html`: parses the embedded `_DRIVE_ivd` data from
+  public Google Drive folder pages and emits visible binary file IDs and names.
+- `resolve_gdrive`: extracts Drive file IDs, expands public Drive folder
+  listings, and builds direct download URLs.
 - `resolve_gofile`: creates a guest account, fetches content metadata, walks
   files recursively, and stores the required cookie.
 - `resolve_swisstransfer`: fetches transfer metadata, generates password tokens
@@ -924,8 +949,9 @@ part of normal use.
 - Provider APIs can change. If Gofile, SwissTransfer, Transfer.it, or another
   provider changes response shape or token requirements, update the resolver and
   this README together.
-- Google Drive can still block files that require login, exceed quota, or show
-  non-download interstitial pages.
+- Google Drive can still block files that require login, exceed quota, show
+  non-download interstitial pages, or hide folder contents from the public HTML
+  listing.
 - Seyarabata support depends on the current `/t/FILE_ID` preview page and
   `/d/FILE_ID` redirect behavior.
 - Transfer.it support depends on the current `xi`, `f`, `xv`, and `g` API
