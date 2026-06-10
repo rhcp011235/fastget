@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # fastget - universal aria2c wrapper with host resolvers.
 # Supports direct URLs, Pixeldrain, Gofile, SwissTransfer, Google Drive,
-# Seyarabata, Transfer.it, Yandex Disk, MediaFire, magnet links, and
+# Seyarabata, Transfer.it, Yandex Disk, MediaFire, Baidu Netdisk, magnet links, and
 # local/remote .torrent files.
 
 set -euo pipefail
@@ -32,6 +32,7 @@ Examples:
   ${PROGRAM} https://drive.google.com/drive/folders/<id>
   ${PROGRAM} https://www.mediafire.com/file/<id>/<name>/file
   ${PROGRAM} https://www.mediafire.com/folder/<id>/<name>
+  ${PROGRAM} https://pan.baidu.com/s/<id>?pwd=<code>
   ${PROGRAM} --interface en9 https://example.com/huge.bin
   ${PROGRAM} --parallel 6 https://example.com/a.bin https://example.com/b.bin
   ${PROGRAM} "magnet:?xt=urn:btih:..."
@@ -39,14 +40,14 @@ Examples:
 
 Supported:
   direct HTTP(S), Pixeldrain, Gofile, SwissTransfer, Google Drive file/folder,
-  Seyarabata, Transfer.it, Yandex Disk, MediaFire, magnet links, local .torrent
-  files, and remote .torrent URLs.
+  Seyarabata, Transfer.it, Yandex Disk, MediaFire, Baidu Netdisk share files,
+  magnet links, local .torrent files, and remote .torrent URLs.
 
 Options:
   --sane                 Use a less aggressive aria2 profile.
   --aggressive           Use the default aggressive aria2 profile.
   -o, --output NAME      Output filename. Used only when one HTTP file resolves.
-  -p, --password VALUE   Password for Gofile, SwissTransfer, or Transfer.it.
+  -p, --password VALUE   Password/code for Gofile, SwissTransfer, Transfer.it, or Baidu.
   --interface IFACE      Bind aria2 sockets to an interface, e.g. en9 for 10GbE.
   --parallel N           Parallel HTTP files after provider resolution.
   --gdrive-cookie-from-clipboard
@@ -56,7 +57,7 @@ Options:
   -h, --help             Show this help.
 
 Environment:
-  FASTGET_PASSWORD       Password fallback for protected hosts.
+  FASTGET_PASSWORD       Password/code fallback for protected hosts.
   FASTGET_INTERFACE      Optional aria2 socket binding interface.
   FASTGET_PARALLEL       Parallel HTTP file downloads, default 4 aggressive.
   FASTGET_GDRIVE_COOKIE  Raw Cookie header for Google Drive account downloads.
@@ -285,8 +286,17 @@ is_mediafire() {
   esac
 }
 
+is_baidu() {
+  local host
+  host="$(url_host "$1")"
+  case "$host" in
+    pan.baidu.com) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 is_password_provider() {
-  is_gofile "$1" || is_swisstransfer "$1" || is_transferit "$1"
+  is_gofile "$1" || is_swisstransfer "$1" || is_transferit "$1" || is_baidu "$1"
 }
 
 is_torrent_like() {
@@ -1651,6 +1661,373 @@ resolve_mediafire() {
   esac
 }
 
+baidu_cookie_value_from_jar() {
+  local cookie_file="$1"
+  local cookie_name="$2"
+
+  awk -v name="$cookie_name" '
+    BEGIN { value = "" }
+    /^#HttpOnly_/ { sub(/^#HttpOnly_/, "", $1) }
+    /^#/ { next }
+    NF >= 7 && $6 == name { value = $7 }
+    END {
+      if (value != "") {
+        print value
+      } else {
+        exit 1
+      }
+    }
+  ' "$cookie_file"
+}
+
+baidu_share_data_from_html() {
+  python3 -c '
+import json
+import sys
+
+html = sys.stdin.read()
+needle = "locals.mset("
+pos = 0
+best = None
+
+while True:
+    start = html.find(needle, pos)
+    if start < 0:
+        break
+    obj_start = start + len(needle)
+    if obj_start >= len(html) or html[obj_start] != "{":
+        pos = obj_start
+        continue
+
+    depth = 0
+    in_string = False
+    escape = False
+    end = None
+    for i in range(obj_start, len(html)):
+        ch = html[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == "\"":
+                in_string = False
+            continue
+        if ch == "\"":
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+
+    if end is None:
+        break
+
+    raw = html[obj_start:end]
+    try:
+        data = json.loads(raw)
+    except Exception:
+        pos = end
+        continue
+
+    if isinstance(data, dict) and data.get("file_list"):
+        best = data
+    pos = end
+
+if not best:
+    raise SystemExit(1)
+
+out = {
+    "share_uk": best.get("share_uk"),
+    "shareid": best.get("shareid"),
+    "public": best.get("public"),
+    "file_list": best.get("file_list") or [],
+    "errno": best.get("errno"),
+    "error": best.get("error"),
+    "expiredType": best.get("expiredType"),
+}
+print(json.dumps(out, ensure_ascii=False, separators=(",", ":")))
+'
+}
+
+baidu_api_error_message() {
+  local json="$1"
+  local context="$2"
+  local errno message
+
+  errno="$(json_value "$json" '.errno // empty')"
+  case "$errno" in
+    0|'') return 0 ;;
+    -20|9019)
+      die "Baidu Netdisk ${context} requires interactive verification/captcha. Open the link in a browser or Baidu Netdisk client."
+      ;;
+    -62)
+      die "Baidu Netdisk extraction code is incorrect. Use -p code or include ?pwd=code."
+      ;;
+    112|113)
+      die "Baidu Netdisk ${context} signature expired or is invalid. Retry the command so fastget can request a fresh sign/timestamp."
+      ;;
+    116|140)
+      die "Baidu Netdisk link is unavailable or malformed."
+      ;;
+    118)
+      die "Baidu Netdisk denied access to this share."
+      ;;
+    *)
+      message="$(json_value "$json" '.show_msg // .errmsg // .err_msg // .error_msg // "unknown error"')"
+      die "Baidu Netdisk ${context} API error ${errno}: ${message}"
+      ;;
+  esac
+}
+
+baidu_resolve_file() {
+  local origin="$1"
+  local cookie_file="$2"
+  local page_url="$3"
+  local share_uk="$4"
+  local shareid="$5"
+  local public_flag="$6"
+  local sign="$7"
+  local timestamp="$8"
+  local fs_id="$9"
+  local filename="${10}"
+  local size="${11}"
+  local file_path="${12}"
+  local api_url bdclnd sekey extra post_args download_json rows tab dlink out_name
+  local path_list
+
+  api_url="https://pan.baidu.com/api/sharedownload?sign=${sign}&timestamp=${timestamp}"
+  path_list=""
+  if [ -n "$file_path" ] && [ "$file_path" != "null" ]; then
+    path_list="$(jq -cn --arg path "$file_path" '[$path]')"
+  fi
+  extra=""
+  case "$public_flag" in
+    0|false)
+      bdclnd="$(baidu_cookie_value_from_jar "$cookie_file" "BDCLND" || true)"
+      [ -n "$bdclnd" ] || die "Baidu Netdisk share cookie BDCLND was not set after extraction-code verification"
+      sekey="$(url_decode_if_possible "$bdclnd")"
+      extra="$(jq -cn --arg sekey "$sekey" '{sekey:$sekey}')"
+      ;;
+  esac
+
+  post_args=(
+    -fsSL
+    -A "${FASTGET_USER_AGENT:-Mozilla/5.0}"
+    -b "$cookie_file"
+    -c "$cookie_file"
+    -H "Referer: ${page_url}"
+    -H "Content-Type: application/x-www-form-urlencoded"
+    --data-urlencode "encrypt=0"
+    --data-urlencode "product=share"
+    --data-urlencode "uk=${share_uk}"
+    --data-urlencode "primaryid=${shareid}"
+    --data-urlencode "fid_list=[${fs_id}]"
+    --data-urlencode "path_list=${path_list}"
+    --data-urlencode "vip=0"
+  )
+  if [ -n "$extra" ]; then
+    post_args+=( --data-urlencode "extra=${extra}" )
+  fi
+
+  if ! download_json="$(curl "${post_args[@]}" "$api_url")"; then
+    die "Baidu Netdisk download-link request failed"
+  fi
+  baidu_api_error_message "$download_json" "download-link"
+
+  if printf '%s' "$download_json" | jq -e '(.list | type == "string") or (.dlink | type == "string")' >/dev/null; then
+    die "Baidu Netdisk returned a native-client payload for ${filename}${size:+ (${size} bytes)}. No direct HTTP dlink was exposed for aria2, so fastget cannot directly download this share without a Baidu client/account path."
+  fi
+
+  rows="$(printf '%s' "$download_json" | jq -r --arg fallback "$filename" '
+    def items:
+      if (.list | type) == "array" then .list[]
+      elif (.dlink | type) == "array" then .dlink[]
+      else empty end;
+    items | [(.dlink // ""), (.server_filename // .file_name // .filename // $fallback)] | @tsv
+  ')"
+  [ -n "$rows" ] || die "Baidu Netdisk response did not include a direct download URL"
+
+  tab="$(printf '\t')"
+  while IFS="$tab" read -r dlink out_name; do
+    [ -n "$dlink" ] || continue
+    out_name="$(sanitize_provider_name "${out_name:-$filename}")"
+    append_download "$dlink" "$out_name" "" "$origin" "baidu"
+    note "Baidu Netdisk: resolved ${out_name}"
+  done <<EOF_ROWS
+${rows}
+EOF_ROWS
+}
+
+resolve_baidu() {
+  local url="$1"
+  local path password tpl_surl verify_surl page_url cookie_file html share_data
+  local encoded_verify_surl encoded_tpl_surl verify_url verify_json errno message
+  local tpl_json sign timestamp share_uk shareid public_flag rows dirs before added tab
+  local fs_id filename size file_path
+
+  need_tool curl "macOS normally includes curl."
+  need_tool jq "Install it with: brew install jq"
+  need_tool python3 "Install it with: brew install python"
+
+  path="$(url_path "$url")"
+  password="$(query_param "$url" "pwd" || true)"
+  if [ -z "$password" ]; then
+    password="$PASSWORD"
+  fi
+
+  tpl_surl=""
+  verify_surl=""
+  case "$path" in
+    /s/*)
+      tpl_surl="${path#/s/}"
+      tpl_surl="${tpl_surl%%/*}"
+      verify_surl="${tpl_surl#1}"
+      [ -n "$verify_surl" ] || verify_surl="$tpl_surl"
+      ;;
+    /share/init)
+      verify_surl="$(query_param "$url" "surl" || true)"
+      [ -n "$verify_surl" ] || die "Could not extract Baidu Netdisk surl from: ${url}"
+      tpl_surl="1${verify_surl}"
+      ;;
+    *)
+      die "Invalid Baidu Netdisk URL. Expected pan.baidu.com/s/<id>?pwd=<code> or pan.baidu.com/share/init?surl=<id>&pwd=<code>"
+      ;;
+  esac
+
+  [ -n "$tpl_surl" ] || die "Could not extract Baidu Netdisk share ID from: ${url}"
+
+  cookie_file="$(mktemp "${TMPDIR:-/tmp}/fastget-baidu-cookies.XXXXXX")" || die "Could not create temporary Baidu cookie jar"
+  FASTGET_BAIDU_COOKIE_FILE_TMP="$cookie_file"
+  trap 'rm -f "$FASTGET_BAIDU_COOKIE_FILE_TMP"' EXIT
+  page_url="https://pan.baidu.com/s/${tpl_surl}"
+  note "Baidu Netdisk: resolving share ${tpl_surl}"
+
+  if ! html="$(curl -fsSL -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" -b "$cookie_file" -c "$cookie_file" "$url")"; then
+    rm -f "$cookie_file"
+    die "Baidu Netdisk share page request failed"
+  fi
+
+  share_data="$(printf '%s' "$html" | baidu_share_data_from_html || true)"
+  if [ -z "$share_data" ] || ! printf '%s' "$share_data" | jq -e '(.file_list // []) | length > 0' >/dev/null; then
+    [ -n "$password" ] || {
+      rm -f "$cookie_file"
+      die "Baidu Netdisk link requires an extraction code. Use -p code or include ?pwd=code."
+    }
+
+    encoded_verify_surl="$(url_encode_if_possible "$verify_surl")"
+    verify_url="https://pan.baidu.com/share/verify?surl=${encoded_verify_surl}&t=$(date +%s000)&channel=chunlei&web=1&app_id=250528&clienttype=0"
+    if ! verify_json="$(curl -fsSL \
+        -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" \
+        -b "$cookie_file" \
+        -c "$cookie_file" \
+        -H "Referer: ${url}" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        --data-urlencode "pwd=${password}" \
+        "$verify_url")"; then
+      rm -f "$cookie_file"
+      die "Baidu Netdisk extraction-code verification request failed"
+    fi
+
+    errno="$(json_value "$verify_json" '.errno // empty')"
+    if [ "$errno" != "0" ]; then
+      message="$(json_value "$verify_json" '.show_msg // .errmsg // .err_msg // "unknown error"')"
+      rm -f "$cookie_file"
+      case "$errno" in
+        -62) die "Baidu Netdisk extraction code is incorrect. Use -p code or include ?pwd=code." ;;
+        *) die "Baidu Netdisk extraction-code verification error ${errno}: ${message}" ;;
+      esac
+    fi
+
+    if ! html="$(curl -fsSL \
+        -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" \
+        -b "$cookie_file" \
+        -c "$cookie_file" \
+        "${page_url}?pwd=$(url_encode_if_possible "$password")")"; then
+      rm -f "$cookie_file"
+      die "Baidu Netdisk unlocked share page request failed"
+    fi
+    share_data="$(printf '%s' "$html" | baidu_share_data_from_html || true)"
+  fi
+
+  [ -n "$share_data" ] || {
+    rm -f "$cookie_file"
+    die "Could not read Baidu Netdisk share metadata. The link may be private, expired, or Baidu changed the page format."
+  }
+
+  encoded_tpl_surl="$(url_encode_if_possible "$tpl_surl")"
+  if ! tpl_json="$(curl -fsSL \
+      -A "${FASTGET_USER_AGENT:-Mozilla/5.0}" \
+      -b "$cookie_file" \
+      -c "$cookie_file" \
+      "https://pan.baidu.com/share/tplconfig?surl=${encoded_tpl_surl}&fields=sign,timestamp&view_mode=1")"; then
+    rm -f "$cookie_file"
+    die "Baidu Netdisk sign/timestamp request failed"
+  fi
+  baidu_api_error_message "$tpl_json" "sign/timestamp"
+
+  sign="$(json_value "$tpl_json" '.data.sign // .result.sign // empty')"
+  timestamp="$(json_value "$tpl_json" '.data.timestamp // .result.timestamp // empty')"
+  [ -n "$sign" ] && [ "$sign" != "null" ] || {
+    rm -f "$cookie_file"
+    die "Baidu Netdisk did not return a download sign"
+  }
+  [ -n "$timestamp" ] && [ "$timestamp" != "null" ] || {
+    rm -f "$cookie_file"
+    die "Baidu Netdisk did not return a download timestamp"
+  }
+
+  share_uk="$(json_value "$share_data" '.share_uk // empty')"
+  shareid="$(json_value "$share_data" '.shareid // empty')"
+  public_flag="$(json_value "$share_data" '.public // empty')"
+  [ -n "$share_uk" ] && [ "$share_uk" != "null" ] || {
+    rm -f "$cookie_file"
+    die "Baidu Netdisk metadata is missing share_uk"
+  }
+  [ -n "$shareid" ] && [ "$shareid" != "null" ] || {
+    rm -f "$cookie_file"
+    die "Baidu Netdisk metadata is missing shareid"
+  }
+
+  dirs="$(printf '%s' "$share_data" | jq -r '[.file_list[]? | select(((.isdir // 0) | tonumber) != 0)] | length')"
+  rows="$(printf '%s' "$share_data" | jq -r '
+    .file_list[]?
+    | select(((.isdir // 0) | tonumber) == 0)
+    | [(.fs_id | tostring), (.server_filename // .filename // "file.bin"), (.size // 0 | tostring), (.path // "")]
+    | @tsv
+  ')"
+  [ -n "$rows" ] || {
+    rm -f "$cookie_file"
+    if [ "$dirs" -gt 0 ] 2>/dev/null; then
+      die "Baidu Netdisk folder shares are not supported unless Baidu exposes plain file entries on the share page."
+    fi
+    die "No downloadable files found in Baidu Netdisk share"
+  }
+  if [ "$dirs" -gt 0 ] 2>/dev/null; then
+    note "Baidu Netdisk: skipping ${dirs} folder entr$( [ "$dirs" -eq 1 ] && printf 'y' || printf 'ies' ); folder expansion is not supported"
+  fi
+
+  before="${#DL_URLS[@]}"
+  tab="$(printf '\t')"
+  while IFS="$tab" read -r fs_id filename size file_path; do
+    [ -n "$fs_id" ] || continue
+    filename="$(sanitize_provider_name "$filename")"
+    baidu_resolve_file "$url" "$cookie_file" "$page_url" "$share_uk" "$shareid" "$public_flag" "$sign" "$timestamp" "$fs_id" "$filename" "$size" "$file_path"
+  done <<EOF_ROWS
+${rows}
+EOF_ROWS
+
+  rm -f "$cookie_file"
+  trap - EXIT
+  FASTGET_BAIDU_COOKIE_FILE_TMP=""
+  added=$((${#DL_URLS[@]} - before))
+  [ "$added" -gt 0 ] || die "No direct Baidu Netdisk download URLs were resolved"
+  note "Baidu Netdisk: ${added} direct file(s) resolved"
+}
+
 resolve_gofile() {
   local url="$1"
   local path content_id account_json account_status account_token
@@ -1835,6 +2212,8 @@ resolve_input() {
     resolve_yandexdisk "$item"
   elif is_mediafire "$item"; then
     resolve_mediafire "$item"
+  elif is_baidu "$item"; then
+    resolve_baidu "$item"
   else
     if is_torrent_like "$item" && ! has_uri_scheme "$item"; then
       case "$(lower "$item")" in
