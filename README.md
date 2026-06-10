@@ -16,6 +16,7 @@ Current supported input types:
 - Transfer.it transfer links.
 - Yandex Disk public links.
 - MediaFire file links.
+- Baidu Netdisk share file links.
 - Magnet links.
 - Local `.torrent` files.
 - Remote HTTP(S) `.torrent` URLs.
@@ -45,6 +46,7 @@ Run downloads from this repo:
 ./fastget 'https://disk.yandex.com.tr/d/PUBLIC_ID'
 ./fastget 'https://www.mediafire.com/file/FILE_ID/FILENAME/file'
 ./fastget 'https://www.mediafire.com/folder/FOLDER_KEY/FOLDER_NAME'
+./fastget 'https://pan.baidu.com/s/SHARE_ID?pwd=CODE'
 ./fastget --interface en9 'https://example.com/huge-file.bin'
 ./fastget --parallel 6 'https://example.com/a.bin' 'https://example.com/b.bin'
 ./fastget 'magnet:?xt=urn:btih:...'
@@ -65,7 +67,8 @@ Options:
 - `--aggressive`: explicitly use the default aggressive profile.
 - `-o, --output NAME`: force the output filename when exactly one HTTP file is
   downloaded.
-- `-p, --password VALUE`: password for Gofile, SwissTransfer, or Transfer.it.
+- `-p, --password VALUE`: password/code for Gofile, SwissTransfer, Transfer.it,
+  or Baidu Netdisk.
 - `--interface IFACE`: bind `aria2c` sockets to one interface. On the target
   MacBook Pro, `en9` is the 10GbE Thunderbolt Ethernet interface.
 - `--parallel N`: number of resolved HTTP files to download in parallel. This
@@ -77,6 +80,7 @@ Password can also be supplied as:
 ```bash
 FASTGET_PASSWORD='secret' fastget 'https://gofile.io/d/CONTENT_ID'
 FASTGET_PASSWORD='secret' fastget 'https://transfer.it/t/TRANSFER_ID'
+FASTGET_PASSWORD='mk5e' fastget 'https://pan.baidu.com/s/SHARE_ID'
 ```
 
 For compatibility with the Telegram bot command style, this also works when the
@@ -94,10 +98,12 @@ download jobs, then runs `aria2c` for each job.
 
 For direct URLs, magnets, and torrents, the input is already usable by `aria2c`.
 For provider links such as Gofile, SwissTransfer, Seyarabata, Transfer.it,
-Yandex Disk, or MediaFire, the script
+Yandex Disk, MediaFire, or Baidu Netdisk, the script
 first resolves the provider page/API, extracts direct file URLs or provider
 download endpoints, chooses output filenames when available, attaches any
-required cookies or tokens, then hands the final URLs to `aria2c`.
+required cookies or tokens, then hands the final URLs to `aria2c`. Baidu
+Netdisk links are handed to `aria2c` only when Baidu exposes direct HTTP
+`dlink` URLs.
 
 The script keeps HTTP downloads and BitTorrent downloads separate because they
 need different `aria2c` options. HTTP downloads benefit from output names,
@@ -605,6 +611,73 @@ Limitations:
   needs its own fresh CDN URL, so huge folders can take time to resolve before
   aria2 starts.
 
+### Baidu Netdisk
+
+Recognized host:
+
+- `pan.baidu.com`
+
+Supported formats:
+
+```text
+https://pan.baidu.com/s/SHARE_ID?pwd=CODE
+https://pan.baidu.com/share/init?surl=SHARE_ID&pwd=CODE
+```
+
+Resolver behavior:
+
+1. Extracts the share token from `/s/...` or `share/init?surl=...`.
+2. Uses the extraction code from `pwd=`. If the URL does not include it, uses
+   `-p` or `FASTGET_PASSWORD`.
+3. Creates a temporary cookie jar and calls:
+
+```text
+POST https://pan.baidu.com/share/verify?surl=SHARE_ID
+```
+
+4. Reads Baidu's `BDCLND` share cookie from the cookie jar.
+5. Fetches the unlocked share page and parses the embedded `locals.mset(...)`
+   JSON for `share_uk`, `shareid`, and top-level `file_list` entries.
+6. Calls Baidu's current template endpoint for the short-lived download
+   signature:
+
+```text
+GET https://pan.baidu.com/share/tplconfig?surl=SHARE_ID&fields=sign,timestamp&view_mode=1
+```
+
+7. Calls:
+
+```text
+POST https://pan.baidu.com/api/sharedownload?sign=SIGN&timestamp=TIMESTAMP
+```
+
+8. Sends `uk`, `primaryid`, `fid_list`, `product=share`, and the decoded
+   `BDCLND` value as `extra.sekey` when the share is not public.
+9. If Baidu returns a plain `list[].dlink` response, appends those direct URLs
+   to aria2 with the filename from Baidu metadata.
+10. If Baidu returns a native-client encrypted payload instead of plain HTTP
+    links, stops with a clear error because there is no direct URL for aria2.
+
+Important detail: Baidu's web client deliberately routes large files and
+folders through the Baidu Netdisk native-client flow. The tested
+`182,536,110,080` byte share resolved metadata and verified the extraction code,
+but `/api/sharedownload` returned an encrypted native-client payload rather than
+a direct HTTP `dlink`. `fastget` cannot hand that payload to aria2 and does not
+try to bypass Baidu's native-client/account path.
+
+Limitations:
+
+- This resolver does not bypass Baidu account, captcha, regional, quota,
+  membership, or native-client requirements.
+- Very large shares may not expose a direct HTTP URL through the web API.
+- Folder expansion is not implemented. Top-level file entries are handled when
+  Baidu exposes them directly in the share page.
+- Baidu signatures and `BDCLND` cookies are short-lived and are generated at
+  resolver time.
+- Baidu can change the share page, `tplconfig`, or `sharedownload` response
+  shape. If that happens, update `baidu_share_data_from_html`,
+  `resolve_baidu`, and this README together.
+
 ### Magnet Links
 
 Recognized format:
@@ -730,8 +803,8 @@ or provider throttling.
 
 General:
 
-- `FASTGET_PASSWORD`: fallback password for Gofile, SwissTransfer, or
-  Transfer.it.
+- `FASTGET_PASSWORD`: fallback password/code for Gofile, SwissTransfer,
+  Transfer.it, or Baidu Netdisk.
 - `FASTGET_INTERFACE`: optional aria2 socket binding interface, for example
   `en9` for the 10GbE Thunderbolt Ethernet port.
 - `FASTGET_PARALLEL`: parallel HTTP file downloads after provider resolution.
@@ -825,8 +898,8 @@ Required for all downloads:
 Required for provider resolvers:
 
 - `curl`: used for API calls and Google Drive filename detection.
-- `jq`: used to parse Gofile, SwissTransfer, Transfer.it, Yandex Disk, and
-  MediaFire folder JSON.
+- `jq`: used to parse Gofile, SwissTransfer, Transfer.it, Yandex Disk,
+  MediaFire folder, and Baidu Netdisk JSON.
 - `shasum`: used to SHA-256 hash Gofile passwords.
 - `base64`: used to encode SwissTransfer passwords.
 
@@ -835,15 +908,15 @@ Optional:
 - `python3`: used to URL-decode Google Drive filename hints, parse public Google
   Drive folder listings and Google Drive warning/error pages, load/decrypt
   Google Chrome cookies for Drive on macOS, URL/base64url encode Transfer.it
-  filenames, and derive Transfer.it password tokens. If it is missing,
-  unprotected Transfer.it links still work, but filenames may fall back to
-  encoded text. Google Drive folder links, Drive warning-page handling, Chrome
-  cookie loading, and password-protected Transfer.it links require Python 3.
+  filenames, derive Transfer.it password tokens, and parse embedded Baidu
+  Netdisk share metadata. If it is missing, unprotected Transfer.it links still
+  work, but filenames may fall back to encoded text. Google Drive folder links,
+  Drive warning-page handling, Chrome cookie loading, password-protected
+  Transfer.it links, and Baidu Netdisk links require Python 3.
 - `security`: macOS Keychain command used only for Google Drive Chrome cookie
   loading.
 - `openssl`: used only for Google Drive Chrome cookie decryption. macOS normally
   includes it.
-
 On macOS, `curl`, `shasum`, and `base64` are normally already present. Install
 the common missing tools with:
 
@@ -864,8 +937,8 @@ Key functions:
 - `url_host`, `url_path`, `query_param`: small URL helpers implemented in Bash.
 - `host_matches`: safe domain matching for provider detection.
 - `is_pixeldrain`, `is_gofile`, `is_swisstransfer`, `is_gdrive`,
-  `is_seyarabata`, `is_transferit`, `is_yandexdisk`, `is_mediafire`: provider
-  detectors.
+  `is_seyarabata`, `is_transferit`, `is_yandexdisk`, `is_mediafire`,
+  `is_baidu`: provider detectors.
 - `is_torrent_like`: detects magnet links and `.torrent` paths/URLs.
 - `looks_like_source`: helps decide whether a second positional argument is a
   password or another source.
@@ -905,6 +978,12 @@ Key functions:
 - `mediafire_resolve_folder_files`, `mediafire_resolve_folder_children`,
   `mediafire_resolve_folder_tree`: list folder contents, walk subfolders, and
   call the single-file MediaFire resolver for each file.
+- `baidu_share_data_from_html`: parses Baidu's embedded `locals.mset(...)`
+  share metadata and emits compact JSON for the resolver.
+- `resolve_baidu`: verifies Baidu extraction codes, requests Baidu's
+  sign/timestamp values, calls `api/sharedownload`, appends plain `dlink` URLs
+  when Baidu exposes them, and fails clearly when Baidu returns only a
+  native-client payload.
 - `resolve_input`: dispatches one user argument to the right resolver.
 - `detect_conn_cap`: reads the local `aria2c` help output and detects the max
   connection cap.
@@ -1035,7 +1114,11 @@ part of normal use.
 - MediaFire support depends on the current landing page exposing a
   `downloadButton` anchor with the signed CDN URL and on the current public
   folder API for folder links.
-- Password support is implemented for Gofile, SwissTransfer, and Transfer.it.
+- Baidu Netdisk support depends on the current share page metadata,
+  `share/tplconfig`, and `api/sharedownload` behavior. Large files may return
+  native-client encrypted payloads instead of direct HTTP links.
+- Password/code support is implemented for Gofile, SwissTransfer, Transfer.it,
+  and Baidu Netdisk.
 - The script downloads files only. It does not upload to Telegram, split files,
   or mirror media. That behavior belongs to the separate Telegram bot project.
 - No automatic cleanup is performed beyond what `aria2c` normally does.
@@ -1069,6 +1152,7 @@ Provider support added directly to `fastget` after the bot port:
 - `resolve_transferit`
 - `resolve_yandexdisk`
 - `resolve_mediafire`
+- `resolve_baidu`
 
 ## License
 
