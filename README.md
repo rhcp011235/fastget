@@ -143,6 +143,9 @@ Key behavior:
   `--min-split-size`, and `--piece-length`.
 - Sends `Accept-Encoding: identity` to avoid compressed transfer surprises.
 - Sends a browser-like user agent by default.
+- Detects AWS Signature V4 presigned URLs and disables aria2's conditional
+  request for those jobs. Presigned object URLs commonly authorize `GET` but
+  reject aria2's preliminary `HEAD` request with HTTP 403.
 - Respects `-o` only when one final HTTP download is being performed.
 
 ### Pixeldrain
