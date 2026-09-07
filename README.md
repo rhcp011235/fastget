@@ -146,6 +146,8 @@ Key behavior:
 - Detects AWS Signature V2 and V4 presigned URLs and disables aria2's
   conditional request for those jobs. Presigned object URLs commonly authorize
   `GET` but reject aria2's preliminary `HEAD` request with HTTP 403.
+- Normalizes common shell-escaped URL separators in quoted HTTP(S) inputs, such
+  as `\?`, `\&`, and `\=`.
 - Respects `-o` only when one final HTTP download is being performed.
 
 ### Pixeldrain
