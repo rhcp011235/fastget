@@ -234,17 +234,20 @@ host_matches() {
   esac
 }
 
-is_aws_sigv4_presigned_url() {
+is_aws_presigned_url() {
   local url="$1"
+  local algorithm signature access_key expires
 
-  case "$url" in
-    *"X-Amz-Algorithm=AWS4-HMAC-SHA256"*) ;;
-    *) return 1 ;;
-  esac
-  case "$url" in
-    *"X-Amz-Signature="*) return 0 ;;
-    *) return 1 ;;
-  esac
+  algorithm="$(query_param "$url" "X-Amz-Algorithm" || true)"
+  signature="$(query_param "$url" "X-Amz-Signature" || true)"
+  if [ "$algorithm" = "AWS4-HMAC-SHA256" ] && [ -n "$signature" ]; then
+    return 0
+  fi
+
+  access_key="$(query_param "$url" "AWSAccessKeyId" || true)"
+  signature="$(query_param "$url" "Signature" || true)"
+  expires="$(query_param "$url" "Expires" || true)"
+  [ -n "$access_key" ] && [ -n "$signature" ] && [ -n "$expires" ]
 }
 
 is_pixeldrain() {
@@ -2273,7 +2276,7 @@ download_one() {
     fi
   else
     opts+=("${HTTP_OPTS[@]}")
-    if is_aws_sigv4_presigned_url "$url"; then
+    if is_aws_presigned_url "$url"; then
       opts+=( --conditional-get=false )
     fi
     if [ -n "$output_name" ]; then
@@ -2340,7 +2343,7 @@ download_http_batch() {
       if [ -n "$cookie" ]; then
         printf '  header=Cookie: %s\n' "$cookie"
       fi
-      if is_aws_sigv4_presigned_url "$url"; then
+      if is_aws_presigned_url "$url"; then
         printf '  conditional-get=false\n'
       fi
     } >>"$input_file"
