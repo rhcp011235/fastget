@@ -146,6 +146,17 @@ is_http() {
   esac
 }
 
+normalize_source_input() {
+  local item="$1"
+
+  if is_http "$item"; then
+    printf '%s' "$item" | sed 's/\\\([?&=#%]\)/\1/g'
+    return 0
+  fi
+
+  printf '%s' "$item"
+}
+
 has_uri_scheme() {
   case "$(lower "$1")" in
     *://*|magnet:*) return 0 ;;
@@ -2447,6 +2458,12 @@ if [ "${#INPUTS[@]}" -lt 1 ]; then
   usage
   exit 1
 fi
+
+idx=0
+while [ "$idx" -lt "${#INPUTS[@]}" ]; do
+  INPUTS[idx]="$(normalize_source_input "${INPUTS[idx]}")"
+  idx=$((idx + 1))
+done
 
 if [ -z "$PASSWORD" ] && [ "${#INPUTS[@]}" -eq 2 ] && is_password_provider "${INPUTS[0]}" && ! looks_like_source "${INPUTS[1]}"; then
   PASSWORD="${INPUTS[1]}"
