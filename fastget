@@ -2289,6 +2289,8 @@ download_one() {
     opts+=("${HTTP_OPTS[@]}")
     if is_aws_presigned_url "$url"; then
       opts+=( --conditional-get=false )
+    else
+      opts+=( --conditional-get=true )
     fi
     if [ -n "$output_name" ]; then
       opts+=( -o "$output_name" )
@@ -2356,6 +2358,8 @@ download_http_batch() {
       fi
       if is_aws_presigned_url "$url"; then
         printf '  conditional-get=false\n'
+      else
+        printf '  conditional-get=true\n'
       fi
     } >>"$input_file"
     idx=$((idx + 1))
@@ -2560,7 +2564,6 @@ COMMON_OPTS=(
 )
 
 HTTP_OPTS=(
-  --conditional-get=true
   --header="Accept-Encoding: identity"
   --user-agent="${FASTGET_USER_AGENT}"
 )
